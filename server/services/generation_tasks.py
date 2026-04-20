@@ -28,7 +28,7 @@ from lib.prompt_utils import (
     is_structured_video_prompt,
     video_prompt_to_yaml,
 )
-from lib.providers import PROVIDER_ARK, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_OPENAI
+from lib.providers import PROVIDER_ARK, PROVIDER_BAILIAN, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_OPENAI
 from lib.storyboard_sequence import (
     build_previous_storyboard_reference,
     find_storyboard_item,
@@ -61,6 +61,7 @@ _PROVIDER_ID_TO_BACKEND: dict[str, str] = {
     PROVIDER_ARK: PROVIDER_ARK,
     PROVIDER_GROK: PROVIDER_GROK,
     PROVIDER_OPENAI: PROVIDER_OPENAI,
+    PROVIDER_BAILIAN: PROVIDER_BAILIAN,
 }
 
 
@@ -739,12 +740,19 @@ async def execute_video_task(
     # 优先从 generated_assets.storyboard_image 读取（宫格模式写 _first.png），回退到默认路径
     assets = item.get("generated_assets", {})
     storyboard_rel = assets.get("storyboard_image") if isinstance(assets, dict) else None
+    storyboard_last_rel = assets.get("storyboard_last_image") if isinstance(assets, dict) else None
     if storyboard_rel:
         storyboard_file = project_path / storyboard_rel
     else:
         storyboard_file = project_path / "storyboards" / f"scene_{resource_id}.png"
     if not storyboard_file.exists():
         raise ValueError(f"storyboard not found: {storyboard_file.name}")
+
+    end_image = None
+    if storyboard_last_rel:
+        storyboard_last_file = project_path / storyboard_last_rel
+        if storyboard_last_file.exists():
+            end_image = storyboard_last_file
 
     prompt_text = _normalize_video_prompt(prompt)
     aspect_ratio = get_aspect_ratio(project, "videos")
@@ -784,8 +792,6 @@ async def execute_video_task(
     duration_seconds = payload.get("duration_seconds") or project.get("default_duration")
     if not duration_seconds:
         duration_seconds = _get_model_default_duration(registry_provider_id, model_name)
-
-    end_image = None  # 宫格模式不再使用首尾帧，统一走普通图生视频
 
     _, version, _, video_uri = await generator.generate_video_async(
         prompt=prompt_text,
@@ -1061,6 +1067,21 @@ def _collect_grid_reference_images(
                     metadata.append({"path": sheet, "name": prop_name, "ref_type": "prop"})
         if len(paths) >= max_count:
             break
+
+    for extra in payload.get("extra_reference_images") or []:
+        if len(paths) >= max_count:
+            break
+        extra_path = Path(extra)
+        if not extra_path.is_absolute():
+            extra_path = project_path / extra_path
+        if not extra_path.exists():
+            continue
+        rel_path = str(extra_path.relative_to(project_path))
+        if rel_path in seen:
+            continue
+        paths.append(extra_path)
+        seen.add(rel_path)
+        metadata.append({"path": rel_path, "name": extra_path.name, "ref_type": "task"})
 
     return list(paths[:max_count]) or None, metadata[:max_count]
 

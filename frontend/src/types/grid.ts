@@ -7,7 +7,7 @@
 export interface ReferenceImage {
   path: string;
   name: string;
-  ref_type: "character" | "scene" | "prop";
+  ref_type: "character" | "scene" | "prop" | "clue" | "task";
 }
 
 export interface FrameCell {

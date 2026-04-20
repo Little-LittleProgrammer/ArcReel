@@ -1,6 +1,6 @@
 """视频生成服务层公共 API。"""
 
-from lib.providers import PROVIDER_ARK, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_NEWAPI, PROVIDER_OPENAI
+from lib.providers import PROVIDER_ARK, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_NEWAPI, PROVIDER_OPENAI, PROVIDER_BAILIAN
 from lib.video_backends.base import (
     VideoBackend,
     VideoCapability,
@@ -15,6 +15,7 @@ __all__ = [
     "PROVIDER_GROK",
     "PROVIDER_NEWAPI",
     "PROVIDER_OPENAI",
+    "PROVIDER_BAILIAN",
     "VideoBackend",
     "VideoCapability",
     "VideoGenerationRequest",
@@ -49,3 +50,8 @@ register_backend(PROVIDER_OPENAI, OpenAIVideoBackend)
 from lib.video_backends.newapi import NewAPIVideoBackend
 
 register_backend(PROVIDER_NEWAPI, NewAPIVideoBackend)
+
+# Bailian
+from lib.video_backends.bailian import BailianVideoBackend
+
+register_backend(PROVIDER_BAILIAN, BailianVideoBackend)

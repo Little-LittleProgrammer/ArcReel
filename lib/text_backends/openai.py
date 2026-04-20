@@ -80,6 +80,13 @@ class OpenAITextBackend:
                 },
             }
 
+        logger.info(
+            "OpenAITextBackend 请求参数 provider=%s model=%s kwargs=%r",
+            PROVIDER_OPENAI,
+            self._model,
+            kwargs,
+        )
+
         try:
             response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
