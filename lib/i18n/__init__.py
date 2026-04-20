@@ -6,14 +6,18 @@ from typing import Annotated, Any
 
 from fastapi import Depends, Request
 
+from .en import assets as en_assets
 from .en import emails as en_emails
 from .en import errors as en_errors
 from .en import providers as en_providers
 from .en import system as en_system
+from .en import templates as en_templates
+from .zh import assets as zh_assets
 from .zh import emails as zh_emails
 from .zh import errors as zh_errors
 from .zh import providers as zh_providers
 from .zh import system as zh_system
+from .zh import templates as zh_templates
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +38,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         **zh_system.MESSAGES,
         **zh_emails.MESSAGES,
         **zh_providers.MESSAGES,
+        **zh_templates.MESSAGES,
+        **zh_assets.MESSAGES,
     },
     "en": {
         **en_errors.MESSAGES,
         **en_system.MESSAGES,
         **en_emails.MESSAGES,
         **en_providers.MESSAGES,
+        **en_templates.MESSAGES,
+        **en_assets.MESSAGES,
     },
 }
 

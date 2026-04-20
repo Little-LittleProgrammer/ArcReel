@@ -13,7 +13,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 if TYPE_CHECKING:
     from server.services.jianying_draft_service import JianyingDraftService
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi import Path as FastAPIPath
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ from lib.i18n import Translator
 from lib.project_change_hints import project_change_source
 from lib.project_manager import ProjectManager
 from lib.status_calculator import StatusCalculator
+from lib.style_templates import is_known_template, resolve_template_prompt
 from server.auth import CurrentUser, create_download_token, verify_download_token
 from server.routers._validators import validate_backend_value
 from server.services.project_archive import (
@@ -44,6 +45,11 @@ router = APIRouter()
 # 初始化项目管理器和状态计算器
 pm = ProjectManager(PROJECT_ROOT / "projects")
 calc = StatusCalculator(pm)
+
+# episode 字段白名单：只允许持久化合法的 on-disk 字段。
+# StatusCalculator 注入的统计字段（scenes_count / status / storyboards / videos 等）
+# 是读时计算值，禁止写回 project.json。
+EPISODE_PERSIST_FIELDS = {"title", "script_file", "generation_mode"}
 
 
 def get_project_manager() -> ProjectManager:
@@ -61,11 +67,32 @@ def get_archive_service() -> ProjectArchiveService:
 class CreateProjectRequest(BaseModel):
     name: str | None = None
     title: str | None = None
-    style: str | None = ""
+    style: str | None = ""  # 保留但不再是用户入口
     content_mode: str | None = "narration"
     aspect_ratio: str | None = "9:16"
     default_duration: int | None = None
     generation_mode: str | None = None
+    # ===== 新增 =====
+    style_template_id: str | None = None
+    video_backend: str | None = None
+    image_backend: str | None = None
+    text_backend_script: str | None = None
+    text_backend_overview: str | None = None
+    text_backend_style: str | None = None
+
+
+class EpisodePatch(BaseModel):
+    """PATCH body entry for a single episode.
+
+    Only whitelisted fields persist; computed fields (scenes_count, status,
+    storyboards, etc.) are silently dropped via extra='ignore'.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    episode: int
+    title: str | None = None
+    script_file: str | None = None
+    generation_mode: Literal["storyboard", "grid", "reference_video"] | None = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -81,6 +108,9 @@ class UpdateProjectRequest(BaseModel):
     text_backend_script: str | None = None
     text_backend_overview: str | None = None
     text_backend_style: str | None = None
+    style_template_id: str | None = None
+    clear_style_image: bool | None = None
+    episodes: list[EpisodePatch] | None = None
 
 
 def _cleanup_temp_file(path: str) -> None:
@@ -340,6 +370,8 @@ async def list_projects(_user: CurrentUser):
                             "name": name,
                             "title": project.get("title", name),
                             "style": project.get("style", ""),
+                            "style_template_id": project.get("style_template_id"),
+                            "style_image": project.get("style_image"),
                             "thumbnail": thumbnail,
                             "status": status,
                         }
@@ -384,18 +416,52 @@ async def create_project(
                 raise HTTPException(status_code=400, detail=_t("title_required"))
             project_name = manual_name or manager.generate_project_name(title)
 
+            style_prompt = req.style or ""
+            if req.style_template_id:
+                if not is_known_template(req.style_template_id):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_t("unknown_style_template", template_id=req.style_template_id),
+                    )
+                style_prompt = resolve_template_prompt(req.style_template_id)
+
+            # 与 update 路径对称：校验所有 backend 字段
+            for field_name in (
+                "video_backend",
+                "image_backend",
+                "text_backend_script",
+                "text_backend_overview",
+                "text_backend_style",
+            ):
+                value = getattr(req, field_name)
+                if value:
+                    validate_backend_value(value, field_name, _t)
+
             try:
                 manager.create_project(project_name)
             except FileExistsError:
                 raise HTTPException(status_code=400, detail=_t("project_exists", name=project_name))
+            extras = {
+                field: value
+                for field in (
+                    "video_backend",
+                    "image_backend",
+                    "text_backend_script",
+                    "text_backend_overview",
+                    "text_backend_style",
+                )
+                if (value := getattr(req, field))
+            }
             with project_change_source("webui"):
                 project = manager.create_project_metadata(
                     project_name,
                     title or manual_name,
-                    req.style,
+                    style_prompt,
                     req.content_mode,
                     aspect_ratio=req.aspect_ratio,
                     default_duration=req.default_duration,
+                    style_template_id=req.style_template_id,
+                    extras=extras or None,
                 )
                 if req.generation_mode is not None:
                     project["generation_mode"] = req.generation_mode
@@ -520,6 +586,62 @@ async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUse
                 else:
                     project["default_duration"] = req.default_duration
 
+            if "style_template_id" in req.model_fields_set:
+                if req.style_template_id is None:
+                    # 取消模版选择：同时清掉展开的 style prompt，避免遗留孤儿文本
+                    project.pop("style_template_id", None)
+                    project["style"] = ""
+                else:
+                    if not is_known_template(req.style_template_id):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=_t("unknown_style_template", template_id=req.style_template_id),
+                        )
+                    project["style_template_id"] = req.style_template_id
+                    project["style"] = resolve_template_prompt(req.style_template_id)
+                    # 强互斥:模版与参考图二选一
+                    project.pop("style_image", None)
+                    project.pop("style_description", None)
+
+            if req.clear_style_image:
+                # 显式清除自定义参考图，用于"取消风格"流程
+                project.pop("style_image", None)
+                project.pop("style_description", None)
+
+            if "episodes" in req.model_fields_set and req.episodes is not None:
+                # 合并 episodes：保留现有 episode 的完整数据，仅更新请求中显式提供的字段。
+                # 使用 model_fields_set（而非 exclude_none）判断字段是否显式出现，使得
+                # `generation_mode: null` 可用于清空集级覆盖、回退到项目级模式继承。
+                # 白名单同时拦截 StatusCalculator 注入的计算字段（scenes_count / status
+                # / storyboards / videos 等），防止写回 project.json。
+                existing_list = project.get("episodes", [])
+                patch_map: dict[int, EpisodePatch] = {}
+                for ep in req.episodes:
+                    patch_map[ep.episode] = ep  # 重复编号：后者覆盖前者
+
+                new_episodes: list[dict] = []
+                for existing_ep in existing_list:
+                    ep_num = existing_ep.get("episode")
+                    patch = patch_map.pop(ep_num, None)
+                    if patch is None:
+                        new_episodes.append(existing_ep)
+                        continue
+                    updated = dict(existing_ep)
+                    for field_name in EPISODE_PERSIST_FIELDS:
+                        if field_name not in patch.model_fields_set:
+                            continue
+                        value = getattr(patch, field_name)
+                        if value is None:
+                            updated.pop(field_name, None)
+                        else:
+                            updated[field_name] = value
+                    new_episodes.append(updated)
+
+                for unknown_ep in patch_map:
+                    logger.warning("Skipping patch for unknown episode %s", unknown_ep)
+
+                project["episodes"] = new_episodes
+
             with project_change_source("webui"):
                 manager.save_project(name, project)
             return {"success": True, "project": project}
@@ -595,7 +717,8 @@ async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _user:
                             "image_prompt",
                             "video_prompt",
                             "characters_in_scene",
-                            "clues_in_scene",
+                            "scenes",
+                            "props",
                             "segment_break",
                             "note",
                         ]:

@@ -13,7 +13,7 @@ description: 将小说转换为短视频的端到端工作流编排器。当用�
 - 每次 dispatch 只传**文件路径和关键参数**，不传大块内容
 - 每个 subagent 完成一个聚焦任务就返回，主 agent 负责阶段间衔接
 
-> 内容模式规格（画面比例、时长等）详见 `.claude/references/content-modes.md`。
+> 三种生成模式（图生视频 / 宫格生视频 / 参考生视频）的数据路径与阶段分支详见 `.claude/references/generation-modes.md`。
 
 ---
 
@@ -22,7 +22,7 @@ description: 将小说转换为短视频的端到端工作流编排器。当用�
 ### 新项目
 
 1. 询问项目名称
-2. 创建 `projects/{名称}/` 及子目录（source/、scripts/、characters/、clues/、storyboards/、videos/、drafts/、output/）
+2. 创建 `projects/{名称}/` 及子目录（source/、scripts/、characters/、scenes/、props/、storyboards/、videos/、drafts/、output/）
 3. 创建 `project.json` 初始文件
 4. **询问内容模式**：`narration`（默认）或 `drama`
 5. 请用户将小说文本放入 `source/`
@@ -40,17 +40,17 @@ description: 将小说转换为短视频的端到端工作流编排器。当用�
 
 进入工作流后，使用 Read 读取 `project.json`，使用 Glob 检查文件系统。按顺序检查，遇到第一个缺失项即确定当前阶段：
 
-1. characters/clues 为空？ → **阶段 1**
+1. characters / scenes / props 中**任一**为空（定义缺失）？ → **阶段 1**
 2. 目标集 source/episode_{N}.txt 不存在？ → **阶段 2**
 3. 目标集 drafts/ 中间文件不存在？ → **阶段 3**
-   - narration: `drafts/episode_{N}/step1_segments.md`
-   - drama: `drafts/episode_{N}/step1_normalized_script.md`
+   - narration（generation_mode ∈ {storyboard, grid}）: `drafts/episode_{N}/step1_segments.md`
+   - drama（generation_mode ∈ {storyboard, grid}）: `drafts/episode_{N}/step1_normalized_script.md`
+   - reference_video: `drafts/episode_{N}/step1_reference_units.md`
 4. scripts/episode_{N}.json 不存在？ → **阶段 4**
-5. 有角色缺少 character_sheet？ → **阶段 5**（与阶段 6 可并行）
-6. 有 importance=major 线索缺少 clue_sheet？ → **阶段 6**（与阶段 5 可并行）
-7. 有场景缺少分镜图？ → **阶段 7**
-8. 有场景缺少视频？ → **阶段 8**
-9. 全部完成 → 工作流结束，引导用户在 Web 端导出剪映草稿
+5. 任一类资产仍有缺 sheet 项（character 缺 character_sheet / scene 缺 scene_sheet / prop 缺 prop_sheet）？ → **阶段 5**（三类并行）
+6. **storyboard / grid 模式**：有场景缺少分镜图？ → **阶段 6**（reference_video 模式跳过）
+7. 有场景/unit 缺少视频？ → **阶段 7**
+8. 全部完成 → 工作流结束，引导用户在 Web 端导出剪映草稿
 
 **确定目标集数**：如果用户未指定，找到最新的未完成集，或询问用户。
 
@@ -69,20 +69,21 @@ description: 将小说转换为短视频的端到端工作流编排器。当用�
 
 ---
 
-## 阶段 1：全局角色/线索设计
+## 阶段 1：全局角色/场景/道具提取
 
-**触发**：project.json 中 characters 或 clues 为空
+**触发**：project.json 中 characters / scenes / props 中**任一**为空（定义缺失）
 
-**dispatch `analyze-characters-clues` subagent**：
+**dispatch `analyze-assets` subagent**：
 
 ```
 项目名称：{project_name}
 项目路径：projects/{project_name}/
 分析范围：{整部小说 / 用户指定的范围}
 已有角色：{已有角色名列表，或"无"}
-已有线索：{已有线索名列表，或"无"}
+已有场景：{已有场景名列表，或"无"}
+已有道具：{已有道具名列表，或"无"}
 
-请分析小说原文，提取角色和线索信息，写入 project.json，返回摘要。
+请分析小说原文，提取角色 / 场景 / 道具信息，写入 project.json，返回摘要。
 ```
 
 ---
@@ -112,12 +113,14 @@ description: 将小说转换为短视频的端到端工作流编排器。当用�
 
 **触发**：目标集的 drafts/ 中间文件不存在
 
-根据 content_mode 选择 subagent：
+根据 `effective_mode(project, episode)` 选择 subagent：
 
-- **narration** → dispatch `split-narration-segments`
-- **drama** → dispatch `normalize-drama-script`
+- generation_mode == `reference_video` → dispatch `split-reference-video-units`
+- content_mode == `narration` → dispatch `split-narration-segments`
+- content_mode == `drama` → dispatch `normalize-drama-script`
 
-dispatch prompt 包含：项目名称、项目路径、集数、本集小说文件路径、角色/线索名称列表。
+dispatch prompt 通用参数：项目名称、项目路径、集数、本集小说文件路径。
+reference_video 额外参数：角色/场景/道具名称列表、`supported_durations`、`max_reference_images`。
 
 ---
 
@@ -129,58 +132,86 @@ dispatch prompt 包含：项目名称、项目路径、集数、本集小说文�
 
 ---
 
-## 阶段 5+6：角色设计 + 线索设计（可并行）
+## 阶段 5：资产设计（character / scene / prop 三类并行）
 
-两个任务互不依赖，**同时 dispatch 两个 `generate-assets` subagent**（如果两者都需要）。
+**前置条件**：三类资产的定义（characters / scenes / props）均已通过阶段 1 写入 project.json。若任一类定义为空（数组缺失），应回到阶段 1 补提取，而非停留在阶段 5。
 
-### subagent A — 角色设计
+**触发**：三类资产中任一类存在缺 sheet 项：
+- character 缺 character_sheet
+- scene 缺 scene_sheet
+- prop 缺 prop_sheet
+
+**调度规则（显式条件判断，按类型独立决定）**：
+
+```
+对于 type ∈ {character, scene, prop}:
+  若该类存在缺 *_sheet 项 → dispatch 对应的 `generate-assets` subagent
+  若该类均已齐全         → 跳过，不 dispatch
+
+三类判断彼此独立，结果可能 dispatch 0~3 个 subagent。
+所有 dispatch 的 subagent 返回后，合并摘要展示给用户，进入阶段间确认。
+```
+
+下面三个 dispatch 块是模板，只实例化满足上述条件的那几个：
+
+### subagent — 角色设计
 
 **触发**：有角色缺少 character_sheet
 
 ```
 dispatch `generate-assets` subagent：
-  任务类型：characters
+  任务类型：character
   项目名称：{project_name}
   项目路径：projects/{project_name}/
   待生成项：{缺失角色名列表}
   脚本命令：
-    python .claude/skills/generate-characters/scripts/generate_character.py --all
+    python .claude/skills/generate-assets/scripts/generate_asset.py --type character --all
   验证方式：重新读取 project.json，检查对应角色的 character_sheet 字段
 ```
 
-### subagent B — 线索设计
+### subagent — 场景设计
 
-**触发**：有 importance=major 线索缺少 clue_sheet
+**触发**：有场景缺少 scene_sheet
 
 ```
 dispatch `generate-assets` subagent：
-  任务类型：clues
+  任务类型：scene
   项目名称：{project_name}
   项目路径：projects/{project_name}/
-  待生成项：{缺失线索名列表}
+  待生成项：{缺失场景名列表}
   脚本命令：
-    python .claude/skills/generate-clues/scripts/generate_clue.py --all
-  验证方式：重新读取 project.json，检查对应线索的 clue_sheet 字段
+    python .claude/skills/generate-assets/scripts/generate_asset.py --type scene --all
+  验证方式：重新读取 project.json，检查对应场景的 scene_sheet 字段
 ```
 
-如果只有其中一个需要执行，只 dispatch 对应的一个。
-两个 subagent 全部返回后，合并摘要展示给用户，进入阶段间确认。
+### subagent — 道具设计
+
+**触发**：有道具缺少 prop_sheet
+
+```
+dispatch `generate-assets` subagent：
+  任务类型：prop
+  项目名称：{project_name}
+  项目路径：projects/{project_name}/
+  待生成项：{缺失道具名列表}
+  脚本命令：
+    python .claude/skills/generate-assets/scripts/generate_asset.py --type prop --all
+  验证方式：重新读取 project.json，检查对应道具的 prop_sheet 字段
+```
 
 ---
 
-## 阶段 7：分镜图生成
+## 阶段 6：分镜图生成（仅 storyboard / grid 模式）
 
-**触发**：有场景缺少分镜图
+**触发**：有场景缺少分镜图；**参考生视频模式跳过此阶段**
 
-检查 `project.json` 的 `generation_mode`：
+检查 `effective_mode(project, episode)`：
 
-- `"single"` 或未设置 → dispatch `generate-storyboard` subagent（现有逻辑）
-- `"grid"` → dispatch `generate-grid` subagent（新增）
-  - generate-grid 自动按 segment_break 分组
-  - 每组 ≥ 4 场景 → 生成宫格图
-  - 每组 < 4 场景 → 退化为逐张生成
+- `"storyboard"` → dispatch `generate-assets` (storyboard 命令：generate_storyboard.py)
+- `"grid"` → dispatch `generate-assets` (grid 命令：generate_grid.py)
+- `"reference_video"` → 不触发，直接跳到阶段 7
 
-### single 模式（默认）
+### storyboard 模式（默认）
 
 **dispatch `generate-assets` subagent**：
 
@@ -210,7 +241,7 @@ dispatch `generate-assets` subagent：
 
 ---
 
-## 阶段 8：视频生成
+## 阶段 7：视频生成
 
 **触发**：有场景缺少视频
 
@@ -241,6 +272,6 @@ dispatch `generate-assets` subagent：
 
 ## 数据分层
 
-- 角色/线索完整定义**只存 project.json**，剧本中仅引用名称
+- 角色 / 场景 / 道具完整定义**只存 project.json**，剧本中仅引用名称
 - 统计字段（scenes_count、status、progress）**读时计算**，不存储
 - 剧集元数据在剧本保存时**写时同步**

@@ -1,6 +1,6 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { voidCall, voidPromise } from "@/utils/async";
+import { voidCall } from "@/utils/async";
 import { useLocation } from "wouter";
 import { useTranslation } from "react-i18next";
 import {
@@ -8,15 +8,16 @@ import {
   ChevronDown,
   FileText,
   Users,
-  Puzzle,
   Film,
   Circle,
   User,
+  Landmark,
+  Package,
   LayoutDashboard,
   Upload,
   X,
 } from "lucide-react";
-import { API } from "@/api";
+import { API, ConflictError } from "@/api";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAppStore } from "@/stores/app-store";
 // ---------------------------------------------------------------------------
@@ -77,7 +78,7 @@ function CollapsibleSection({
 }
 
 // ---------------------------------------------------------------------------
-// AssetThumbnail — shared thumbnail for characters (circle) and clues (square)
+// AssetThumbnail — shared thumbnail for characters (circle) and scenes/props (square)
 // ---------------------------------------------------------------------------
 
 function AssetThumbnail({
@@ -124,7 +125,23 @@ function AssetThumbnail({
 }
 
 // ---------------------------------------------------------------------------
-// EmptyState — shared empty placeholder
+// EmptyAction — clickable empty placeholder that navigates to relevant page
+// ---------------------------------------------------------------------------
+
+function EmptyAction({ text, onClick }: { text: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="w-full text-left px-8 py-2 text-[11px] italic text-gray-500 hover:text-gray-300 hover:bg-gray-800/40 transition-colors"
+    >
+      {text} →
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// EmptyState — shared empty placeholder (used for source files / episodes)
 // ---------------------------------------------------------------------------
 
 function EmptyState({ text }: { text: string }) {
@@ -153,12 +170,14 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
   const [location, setLocation] = useLocation();
 
   const characters = currentProjectData?.characters ?? {};
-  const clues = currentProjectData?.clues ?? {};
+  const scenes = currentProjectData?.scenes ?? {};
+  const props = currentProjectData?.props ?? {};
   const episodes = currentProjectData?.episodes ?? [];
   const projectName = currentProjectName ?? "";
 
   // 源文件列表
-  const [sourceFiles, setSourceFiles] = useState<string[]>([]);
+  type SourceItem = { name: string; rawFilename: string | null };
+  const [sourceFiles, setSourceFiles] = useState<SourceItem[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadSourceFiles = useCallback(() => {
@@ -168,13 +187,11 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
     }
     API.listFiles(projectName)
       .then((res) => {
-        const raw = res.files as unknown;
-        if (Array.isArray(raw)) {
-          setSourceFiles(raw);
-        } else if (raw && typeof raw === "object") {
-          const grouped = raw as Record<string, Array<{ name: string }>>;
-          setSourceFiles((grouped.source ?? []).map((f) => f.name));
-        }
+        const items: SourceItem[] = (res.files.source ?? []).map((f) => ({
+          name: f.name,
+          rawFilename: f.raw_filename ?? null,
+        }));
+        setSourceFiles(items);
       })
       .catch(() => {
         setSourceFiles([]);
@@ -193,8 +210,23 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
       await API.uploadFile(projectName, "source", file);
       loadSourceFiles();
       useAppStore.getState().invalidateSourceFiles();
-    } catch {
-      // 静默失败
+    } catch (err) {
+      // 侧边栏只给即时反馈，不弹冲突决策框（那个走主面板 OverviewCanvas）；
+      // 同名冲突提示建议改名，其他错误复用通用 upload_failed 前缀
+      if (err instanceof ConflictError) {
+        useAppStore.getState().pushToast(
+          tRef.current("dashboard:source_upload_conflict_toast", {
+            filename: err.existing,
+            suggested: err.suggestedName,
+          }),
+          "error",
+        );
+      } else {
+        useAppStore.getState().pushToast(
+          `${tRef.current("dashboard:upload_failed")}${(err as Error).message}`,
+          "error",
+        );
+      }
     }
     // 重置 input 以允许再次选择同一文件
     e.target.value = "";
@@ -218,7 +250,8 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
   }, [projectName, loadSourceFiles, location, setLocation]);
 
   const characterEntries = Object.entries(characters);
-  const clueEntries = Object.entries(clues);
+  const sceneEntries = Object.entries(scenes);
+  const propEntries = Object.entries(props);
 
   // Check if a path is active (matches current nested location)
   const isActive = (path: string) => location === path;
@@ -261,9 +294,9 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".txt,.md,.doc,.docx"
+              accept=".txt,.md,.docx,.epub,.pdf"
               aria-label={t("dashboard:upload_asset_file_aria")}
-              onChange={voidPromise(handleUpload)}
+              onChange={(e) => voidCall(handleUpload(e))}
               className="hidden"
             />
           </>
@@ -273,11 +306,11 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
           <EmptyState text={t("dashboard:no_files_yet")} />
         ) : (
           <ul>
-            {sourceFiles.map((name) => {
-              const filePath = `/source/${encodeURIComponent(name)}`;
+            {sourceFiles.map((item) => {
+              const filePath = `/source/${encodeURIComponent(item.name)}`;
               const active = isActive(filePath);
               return (
-                <li key={name}>
+                <li key={item.name}>
                   <div
                     className={`group flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
                       active
@@ -291,11 +324,26 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
                       className="flex flex-1 items-center gap-2 truncate text-left focus-ring rounded"
                     >
                       <FileText className="h-3.5 w-3.5 shrink-0 text-gray-500" />
-                      <span className="truncate">{name}</span>
+                      <span className="truncate">{item.name}</span>
                     </button>
+                    {item.rawFilename && (
+                      <a
+                        href={API.getFileUrl(
+                          projectName,
+                          `source/raw/${encodeURIComponent(item.rawFilename)}`,
+                        )}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={t("common:download_original")}
+                        onClick={(e) => e.stopPropagation()}
+                        className="shrink-0 rounded p-0.5 text-xs text-gray-500 opacity-60 transition-opacity hover:opacity-100 focus-ring"
+                      >
+                        📎
+                      </a>
+                    )}
                     <button
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); voidCall(handleDeleteFile(name)); }}
+                      onClick={(e) => { e.stopPropagation(); voidCall(handleDeleteFile(item.name)); }}
                       className="shrink-0 rounded p-0.5 text-gray-600 opacity-0 transition-opacity hover:text-red-400 group-hover:opacity-100 focus-ring focus-visible:opacity-100"
                       title={t("dashboard:delete_file")}
                     >
@@ -312,86 +360,99 @@ export function AssetSidebar({ className }: AssetSidebarProps) {
       {/* ---- Divider ---- */}
       <div className="mx-3 border-t border-gray-800" />
 
-      {/* ---- Section 2: Lorebook (Characters + Clues) ---- */}
-      <CollapsibleSection title={t("dashboard:lorebook")} icon={Users} defaultOpen={true}>
-        {/* Characters sub-section */}
-        <div className="mb-1">
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Users className="h-3 w-3" />
-            <span>{t("dashboard:characters")}</span>
-          </div>
-          {characterEntries.length === 0 ? (
-            <EmptyState text={t("dashboard:no_characters_hint")} />
-          ) : (
-            <ul>
-              {characterEntries.map(([name, char]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/characters")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
-                      isActive("/characters")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <AssetThumbnail
-                      name={name}
-                      sheetPath={char.character_sheet}
-                      projectName={projectName}
-                      shape="circle"
-                      FallbackIcon={User}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+      {/* ---- Section 2: Characters ---- */}
+      <CollapsibleSection title={t("dashboard:characters")} icon={Users} defaultOpen={true}>
+        {characterEntries.length === 0 ? (
+          <EmptyAction onClick={() => setLocation("/characters")} text={t("dashboard:no_characters_hint_clickable")} />
+        ) : (
+          <ul>
+            {characterEntries.map(([name, char]) => (
+              <li key={name}>
+                <button
+                  type="button"
+                  onClick={() => setLocation("/characters")}
+                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
+                    isActive("/characters")
+                      ? "bg-gray-800 text-white"
+                      : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
+                  }`}
+                >
+                  <AssetThumbnail
+                    name={name}
+                    sheetPath={char.character_sheet}
+                    projectName={projectName}
+                    shape="circle"
+                    FallbackIcon={User}
+                  />
+                  <span className="truncate">{name}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CollapsibleSection>
 
-        {/* Clues sub-section */}
-        <div>
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Puzzle className="h-3 w-3" />
-            <span>{t("dashboard:clues")}</span>
-          </div>
-          {clueEntries.length === 0 ? (
-            <EmptyState text={t("dashboard:no_clues_hint")} />
-          ) : (
-            <ul>
-              {clueEntries.map(([name, clue]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/clues")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
-                      isActive("/clues")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <AssetThumbnail
-                      name={name}
-                      sheetPath={clue.clue_sheet}
-                      projectName={projectName}
-                      shape="square"
-                      FallbackIcon={Puzzle}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+      <div className="mx-3 border-t border-gray-800" />
+
+      {/* ---- Section 3: Scenes ---- */}
+      <CollapsibleSection title={t("dashboard:scenes")} icon={Landmark} defaultOpen={true}>
+        {sceneEntries.length === 0 ? (
+          <EmptyAction onClick={() => setLocation("/scenes")} text={t("dashboard:no_scenes_hint_clickable")} />
+        ) : (
+          <ul>
+            {sceneEntries.map(([name, scene]) => (
+              <li key={name}>
+                <button
+                  type="button"
+                  onClick={() => setLocation("/scenes")}
+                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
+                    isActive("/scenes")
+                      ? "bg-gray-800 text-white"
+                      : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
+                  }`}
+                >
+                  <AssetThumbnail name={name} sheetPath={scene.scene_sheet} projectName={projectName} shape="square" FallbackIcon={Landmark} />
+                  <span className="truncate">{name}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CollapsibleSection>
+
+      <div className="mx-3 border-t border-gray-800" />
+
+      {/* ---- Section 4: Props ---- */}
+      <CollapsibleSection title={t("dashboard:props")} icon={Package} defaultOpen={true}>
+        {propEntries.length === 0 ? (
+          <EmptyAction onClick={() => setLocation("/props")} text={t("dashboard:no_props_hint_clickable")} />
+        ) : (
+          <ul>
+            {propEntries.map(([name, prop]) => (
+              <li key={name}>
+                <button
+                  type="button"
+                  onClick={() => setLocation("/props")}
+                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
+                    isActive("/props")
+                      ? "bg-gray-800 text-white"
+                      : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
+                  }`}
+                >
+                  <AssetThumbnail name={name} sheetPath={prop.prop_sheet} projectName={projectName} shape="square" FallbackIcon={Package} />
+                  <span className="truncate">{name}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </CollapsibleSection>
 
       {/* ---- Divider ---- */}
       <div className="mx-3 border-t border-gray-800" />
 
       {/* ---- Section 3: Episodes ---- */}
-      <CollapsibleSection title={t("dashboard:episodes")} icon={Film}>
+      <CollapsibleSection title={t("dashboard:episodes")} icon={Film} defaultOpen={true}>
         {episodes.length === 0 ? (
           <EmptyState text={t("dashboard:no_episodes_yet")} />
         ) : (

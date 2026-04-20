@@ -36,8 +36,13 @@ import type {
   CustomProviderModelInput,
   DiscoveredModel,
   CostEstimateResponse,
+  ReferenceVideoUnit,
+  ReferenceResource,
+  TransitionType,
 } from "@/types";
+import type { GenerationMode } from "@/utils/generation-mode";
 import type { GridGeneration } from "@/types/grid";
+import type { Asset, AssetType, AssetCreatePayload, AssetUpdatePayload } from "@/types/asset";
 import { getToken, clearToken } from "@/utils/auth";
 import i18n from "./i18n";
 
@@ -52,6 +57,22 @@ export interface LoginResponse {
 /** Standard error response body from backend (mirrors FastAPI HTTPException detail). */
 export interface ErrorResponse {
   detail: string | { msg?: string }[];
+}
+
+/**
+ * Error thrown when uploading a source file conflicts with an existing file
+ * (HTTP 409). Carries the existing filename and a server-suggested alternative
+ * so callers can prompt the user to retry with `on_conflict=rename|replace`.
+ */
+export class ConflictError extends Error {
+  constructor(
+    public readonly existing: string,
+    public readonly suggestedName: string,
+    message: string
+  ) {
+    super(message);
+    this.name = "ConflictError";
+  }
 }
 
 /** Error payload from the import project endpoint (extends ErrorResponse with import-specific fields). */
@@ -133,6 +154,22 @@ export interface UsageCallsFilters {
 export interface SuccessResponse {
   success: boolean;
   message?: string;
+}
+
+/** Payload for {@link API.createProject}. */
+export interface CreateProjectPayload {
+  title: string;
+  name?: string;
+  content_mode?: "narration" | "drama";
+  aspect_ratio?: "9:16" | "16:9";
+  generation_mode?: GenerationMode;
+  default_duration?: number | null;
+  style_template_id?: string | null;
+  video_backend?: string | null;
+  image_backend?: string | null;
+  text_backend_script?: string | null;
+  text_backend_overview?: string | null;
+  text_backend_style?: string | null;
 }
 
 /** Draft metadata returned by listDrafts. */
@@ -287,23 +324,11 @@ class API {
   }
 
   static async createProject(
-    title: string,
-    style: string = "",
-    contentMode: string = "narration",
-    aspectRatio: string = "9:16",
-    defaultDuration: number | null = null,
-    generationMode: "single" | "grid" = "single",
+    payload: CreateProjectPayload,
   ): Promise<{ success: boolean; name: string; project: ProjectData }> {
     return this.request("/projects", {
       method: "POST",
-      body: JSON.stringify({
-        title,
-        style,
-        content_mode: contentMode,
-        aspect_ratio: aspectRatio,
-        default_duration: defaultDuration,
-        generation_mode: generationMode,
-      }),
+      body: JSON.stringify(payload),
     });
   }
 
@@ -319,7 +344,7 @@ class API {
 
   static async updateProject(
     name: string,
-    updates: Partial<ProjectData>
+    updates: Partial<ProjectData> & { clear_style_image?: boolean }
   ): Promise<{ success: boolean; project: ProjectData }> {
     if ("content_mode" in updates) {
       throw new Error("项目创建后不支持修改 content_mode");
@@ -476,36 +501,29 @@ class API {
     );
   }
 
-  // ==================== 线索管理 ====================
+  // ==================== 项目场景管理 ====================
 
-  static async addClue(
+  static async addProjectScene(
     projectName: string,
     name: string,
-    clueType: string,
-    description: string,
-    importance: string = "major"
+    description: string
   ): Promise<SuccessResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/clues`,
+      `/projects/${encodeURIComponent(projectName)}/scenes`,
       {
         method: "POST",
-        body: JSON.stringify({
-          name,
-          clue_type: clueType,
-          description,
-          importance,
-        }),
+        body: JSON.stringify({ name, description }),
       }
     );
   }
 
-  static async updateClue(
+  static async updateProjectScene(
     projectName: string,
-    clueName: string,
+    sceneName: string,
     updates: Record<string, unknown>
   ): Promise<SuccessResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/clues/${encodeURIComponent(clueName)}`,
+      `/projects/${encodeURIComponent(projectName)}/scenes/${encodeURIComponent(sceneName)}`,
       {
         method: "PATCH",
         body: JSON.stringify(updates),
@@ -513,12 +531,54 @@ class API {
     );
   }
 
-  static async deleteClue(
+  static async deleteProjectScene(
     projectName: string,
-    clueName: string
+    sceneName: string
   ): Promise<SuccessResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/clues/${encodeURIComponent(clueName)}`,
+      `/projects/${encodeURIComponent(projectName)}/scenes/${encodeURIComponent(sceneName)}`,
+      {
+        method: "DELETE",
+      }
+    );
+  }
+
+  // ==================== 项目道具管理 ====================
+
+  static async addProjectProp(
+    projectName: string,
+    name: string,
+    description: string
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/props`,
+      {
+        method: "POST",
+        body: JSON.stringify({ name, description }),
+      }
+    );
+  }
+
+  static async updateProjectProp(
+    projectName: string,
+    propName: string,
+    updates: Record<string, unknown>
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/props/${encodeURIComponent(propName)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(updates),
+      }
+    );
+  }
+
+  static async deleteProjectProp(
+    projectName: string,
+    propName: string
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/props/${encodeURIComponent(propName)}`,
       {
         method: "DELETE",
       }
@@ -573,29 +633,83 @@ class API {
     projectName: string,
     uploadType: string,
     file: File,
-    name: string | null = null
-  ): Promise<{ success: boolean; path: string; url: string }> {
+    name: string | null = null,
+    options: { onConflict?: "fail" | "replace" | "rename" } = {}
+  ): Promise<{
+    success: boolean;
+    path: string;
+    url: string;
+    filename?: string;
+    normalized?: boolean;
+    original_kept?: boolean;
+    original_filename?: string;
+    used_encoding?: string | null;
+    chapter_count?: number;
+  }> {
     const formData = new FormData();
     formData.append("file", file);
 
-    let url = `/projects/${encodeURIComponent(projectName)}/upload/${uploadType}`;
-    if (name) {
-      url += `?name=${encodeURIComponent(name)}`;
+    const qsParts: string[] = [];
+    if (name) qsParts.push(`name=${encodeURIComponent(name)}`);
+    if (uploadType === "source" && options.onConflict) {
+      qsParts.push(`on_conflict=${encodeURIComponent(options.onConflict)}`);
     }
+    const qs = qsParts.join("&");
+    const url = `/projects/${encodeURIComponent(projectName)}/upload/${uploadType}${qs ? "?" + qs : ""}`;
 
     const response = await fetch(`${API_BASE}${url}`, withAuth({
       method: "POST",
       body: formData,
     }));
 
-    await throwIfNotOk(response, "上传失败");
+    if (response.status === 409) {
+      let detail: { existing?: string; suggested_name?: string; message?: string } | null = null;
+      try {
+        const body = (await response.json()) as { detail?: { existing?: string; suggested_name?: string; message?: string } };
+        detail = body?.detail ?? null;
+      } catch {
+        /* ignore */
+      }
+      // 后端 SourceLoader 的 ConflictError 必然携带 existing + suggested_name；
+      // 若 detail 缺字段则视为协议异常，抛通用错误（带文件名标识）而非手搓 fallback —
+      // 避免前端"猜"一个可能与后端命名规则不一致的 suggested_name 误导用户
+      if (!detail?.existing || !detail?.suggested_name) {
+        throw new Error(`上传 "${file.name}" 失败：服务端返回 409 但 detail 字段不完整`);
+      }
+      throw new ConflictError(
+        detail.existing,
+        detail.suggested_name,
+        detail.message ?? "conflict",
+      );
+    }
 
-    return response.json() as Promise<{ success: boolean; path: string; url: string }>;
+    await throwIfNotOk(response, "上传失败");
+    return (await response.json()) as {
+      success: boolean;
+      path: string;
+      url: string;
+      filename?: string;
+      normalized?: boolean;
+      original_kept?: boolean;
+      original_filename?: string;
+      used_encoding?: string | null;
+      chapter_count?: number;
+    };
   }
 
   static async listFiles(
     projectName: string
-  ): Promise<{ files: Record<string, { name: string; size: number; url: string }[]> }> {
+  ): Promise<{
+    files: {
+      source?: { name: string; size: number; url: string; raw_filename?: string | null }[];
+      characters?: { name: string; size: number; url: string }[];
+      scenes?: { name: string; size: number; url: string }[];
+      props?: { name: string; size: number; url: string }[];
+      storyboards?: { name: string; size: number; url: string }[];
+      videos?: { name: string; size: number; url: string }[];
+      output?: { name: string; size: number; url: string }[];
+    };
+  }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/files`
     );
@@ -846,14 +960,14 @@ class API {
   }
 
   /**
-   * 生成线索设计图
+   * 生成场景设计图
    * @param projectName - 项目名称
-   * @param clueName - 线索名称
-   * @param prompt - 线索描述 prompt
+   * @param sceneName - 场景名称
+   * @param prompt - 场景描述 prompt
    */
-  static async generateClue(
+  static async generateProjectScene(
     projectName: string,
-    clueName: string,
+    sceneName: string,
     prompt: string
   ): Promise<{
     success: boolean;
@@ -861,7 +975,31 @@ class API {
     message: string;
   }> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/generate/clue/${encodeURIComponent(clueName)}`,
+      `/projects/${encodeURIComponent(projectName)}/generate/scene/${encodeURIComponent(sceneName)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      }
+    );
+  }
+
+  /**
+   * 生成道具设计图
+   * @param projectName - 项目名称
+   * @param propName - 道具名称
+   * @param prompt - 道具描述 prompt
+   */
+  static async generateProjectProp(
+    projectName: string,
+    propName: string,
+    prompt: string
+  ): Promise<{
+    success: boolean;
+    task_id: string;
+    message: string;
+  }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/generate/prop/${encodeURIComponent(propName)}`,
       {
         method: "POST",
         body: JSON.stringify({ prompt }),
@@ -1042,7 +1180,7 @@ class API {
   /**
    * 获取资源版本列表
    * @param projectName - 项目名称
-   * @param resourceType - 资源类型 (storyboards, videos, characters, clues)
+   * @param resourceType - 资源类型 (storyboards, videos, characters, scenes, props)
    * @param resourceId - 资源 ID
    */
   static async getVersions(
@@ -1112,39 +1250,6 @@ class API {
     await throwIfNotOk(response, "上传失败");
 
     return response.json() as Promise<{ success: boolean; style_image: string; style_description: string; url: string }>;
-  }
-
-  /**
-   * 删除风格参考图
-   * @param projectName - 项目名称
-   */
-  static async deleteStyleImage(
-    projectName: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/style-image`,
-      {
-        method: "DELETE",
-      }
-    );
-  }
-
-  /**
-   * 更新风格描述
-   * @param projectName - 项目名称
-   * @param styleDescription - 风格描述
-   */
-  static async updateStyleDescription(
-    projectName: string,
-    styleDescription: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/style-description`,
-      {
-        method: "PATCH",
-        body: JSON.stringify({ style_description: styleDescription }),
-      }
-    );
   }
 
   // ==================== 助手会话 API ====================
@@ -1526,6 +1631,192 @@ class API {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}/regenerate`,
       { method: "POST" }
+    );
+  }
+
+  // ==================== Global Asset Library ====================
+
+  static async listAssets(
+    params: { type?: AssetType; q?: string; limit?: number; offset?: number } = {},
+    options: RequestInit = {},
+  ) {
+    const usp = new URLSearchParams();
+    if (params.type) usp.set("type", params.type);
+    if (params.q) usp.set("q", params.q);
+    if (params.limit) usp.set("limit", String(params.limit));
+    if (params.offset) usp.set("offset", String(params.offset));
+    return this.request<{ items: Asset[] }>(`/assets?${usp.toString()}`, options);
+  }
+
+  static async getAsset(id: string) {
+    return this.request<{ asset: Asset }>(`/assets/${encodeURIComponent(id)}`);
+  }
+
+  static async createAsset(payload: AssetCreatePayload & { image?: File }) {
+    const form = new FormData();
+    form.append("type", payload.type);
+    form.append("name", payload.name);
+    form.append("description", payload.description ?? "");
+    form.append("voice_style", payload.voice_style ?? "");
+    if (payload.image) form.append("image", payload.image);
+    const url = `${API_BASE}/assets`;
+    const response = await fetch(url, withAuth({ method: "POST", body: form }));
+    if (!response.ok) {
+      handleUnauthorized(response);
+      const error = (await response.json().catch(() => ({ detail: response.statusText }))) as {
+        detail?: string;
+      };
+      throw new Error(typeof error.detail === "string" ? error.detail : "请求失败");
+    }
+    return response.json() as Promise<{ asset: Asset }>;
+  }
+
+  static async updateAsset(id: string, patch: AssetUpdatePayload) {
+    return this.request<{ asset: Asset }>(`/assets/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  }
+
+  static async replaceAssetImage(id: string, image: File) {
+    const form = new FormData();
+    form.append("image", image);
+    const url = `${API_BASE}/assets/${encodeURIComponent(id)}/image`;
+    const response = await fetch(url, withAuth({ method: "POST", body: form }));
+    if (!response.ok) {
+      handleUnauthorized(response);
+      const error = (await response.json().catch(() => ({ detail: response.statusText }))) as {
+        detail?: string;
+      };
+      throw new Error(typeof error.detail === "string" ? error.detail : "请求失败");
+    }
+    return response.json() as Promise<{ asset: Asset }>;
+  }
+
+  static async deleteAsset(id: string): Promise<void> {
+    return this.request(`/assets/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
+  static async addAssetFromProject(payload: {
+    project_name: string;
+    resource_type: AssetType;
+    resource_id: string;
+    override_name?: string;
+    overwrite?: boolean;
+  }) {
+    return this.request<{ asset: Asset }>(`/assets/from-project`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  static async applyAssetsToProject(payload: {
+    asset_ids: string[];
+    target_project: string;
+    conflict_policy: "skip" | "overwrite" | "rename";
+  }) {
+    return this.request<{
+      succeeded: Array<{ id: string; name: string }>;
+      skipped: Array<{ id: string; name: string }>;
+      failed: Array<{ id: string; reason: string }>;
+    }>(`/assets/apply-to-project`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  static getGlobalAssetUrl(path: string | null, fp?: string | null): string | null {
+    if (!path) return null;
+    const parts = path.split("/");
+    if (parts.length < 3 || parts[0] !== "_global_assets") return null;
+    const type = parts[1];
+    const filename = parts.slice(2).join("/");
+    const qs = fp ? `?fp=${encodeURIComponent(fp)}` : "";
+    return `${API_BASE}/global-assets/${type}/${filename}${qs}`;
+  }
+
+  // ==================== Reference-to-Video API ====================
+
+  /** List reference-video units for an episode. */
+  static async listReferenceVideoUnits(
+    projectName: string,
+    episode: number,
+  ): Promise<{ units: ReferenceVideoUnit[] }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units`,
+    );
+  }
+
+  /** Create a new reference-video unit. */
+  static async addReferenceVideoUnit(
+    projectName: string,
+    episode: number,
+    payload: {
+      prompt: string;
+      references: ReferenceResource[];
+      duration_seconds?: number;
+      transition_to_next?: TransitionType;
+      note?: string | null;
+    },
+  ): Promise<{ unit: ReferenceVideoUnit }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units`,
+      { method: "POST", body: JSON.stringify(payload) },
+    );
+  }
+
+  /** Patch prompt/references/duration/transition/note on an existing unit. */
+  static async patchReferenceVideoUnit(
+    projectName: string,
+    episode: number,
+    unitId: string,
+    patch: {
+      prompt?: string;
+      references?: ReferenceResource[];
+      duration_seconds?: number;
+      transition_to_next?: TransitionType;
+      note?: string | null;
+    },
+  ): Promise<{ unit: ReferenceVideoUnit }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}`,
+      { method: "PATCH", body: JSON.stringify(patch) },
+    );
+  }
+
+  /** Delete a unit. Returns void on 204. */
+  static async deleteReferenceVideoUnit(
+    projectName: string,
+    episode: number,
+    unitId: string,
+  ): Promise<void> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  /** Reorder units by providing the full ordered unit_id list. */
+  static async reorderReferenceVideoUnits(
+    projectName: string,
+    episode: number,
+    unitIds: string[],
+  ): Promise<{ units: ReferenceVideoUnit[] }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/reorder`,
+      { method: "POST", body: JSON.stringify({ unit_ids: unitIds }) },
+    );
+  }
+
+  /** Enqueue generation; returns 202 with task_id. */
+  static async generateReferenceVideoUnit(
+    projectName: string,
+    episode: number,
+    unitId: string,
+  ): Promise<{ task_id: string; deduped: boolean }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/generate`,
+      { method: "POST" },
     );
   }
 }

@@ -7,6 +7,8 @@
 import asyncio
 import json
 import logging
+import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -16,10 +18,20 @@ from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from lib import PROJECT_ROOT
+from lib.asset_types import ASSET_TYPES
 from lib.i18n import Translator
 from lib.image_utils import normalize_uploaded_image
 from lib.project_change_hints import emit_project_change_batch, project_change_source
 from lib.project_manager import ProjectManager
+from lib.source_loader import (
+    ConflictError,
+    CorruptFileError,
+    FileSizeExceededError,
+    NormalizeResult,
+    SourceDecodeError,
+    SourceLoader,
+    UnsupportedFormatError,
+)
 from server.auth import CurrentUser
 
 router = APIRouter()
@@ -34,10 +46,11 @@ def get_project_manager() -> ProjectManager:
 
 # 允许的文件类型
 ALLOWED_EXTENSIONS = {
-    "source": [".txt", ".md", ".doc", ".docx"],
+    "source": [".txt", ".md", ".docx", ".epub", ".pdf"],
     "character": [".png", ".jpg", ".jpeg", ".webp"],
     "character_ref": [".png", ".jpg", ".jpeg", ".webp"],
-    "clue": [".png", ".jpg", ".jpeg", ".webp"],
+    "scene": [".png", ".jpg", ".jpeg", ".webp"],
+    "prop": [".png", ".jpg", ".jpeg", ".webp"],
     "storyboard": [".png", ".jpg", ".jpeg", ".webp"],
 }
 
@@ -74,6 +87,29 @@ async def serve_project_file(project_name: str, path: str, request: Request, _t:
         raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))
 
 
+@router.get("/global-assets/{asset_type}/{filename}")
+async def serve_global_asset(asset_type: str, filename: str, _t: Translator):
+    """服务 _global_assets 下的全局资产图片（character/scene/prop）"""
+    if asset_type not in ASSET_TYPES:
+        raise HTTPException(status_code=400, detail=_t("invalid_asset_type"))
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail=_t("invalid_asset_filename"))
+
+    root = get_project_manager().get_global_assets_root()
+    path = root / asset_type / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail=_t("file_not_found", path=filename))
+
+    # 防御性检查：即使 filename 通过了字符串校验，也要确保解析后的路径仍在 root 之内
+    # （防御 symlink / URL 编码等边界场景）
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail=_t("forbidden_access"))
+
+    return FileResponse(str(path))
+
+
 @router.post("/projects/{project_name}/upload/{upload_type}")
 async def upload_file(
     project_name: str,
@@ -82,15 +118,17 @@ async def upload_file(
     _t: Translator,
     file: UploadFile = File(...),
     name: str = None,
+    on_conflict: str = "fail",
 ):
     """
     上传文件
 
     Args:
         project_name: 项目名称
-        upload_type: 上传类型 (source/character/clue/storyboard)
+        upload_type: 上传类型 (source/character/prop/storyboard)
         file: 上传的文件
-        name: 可选，用于角色/线索名称，或分镜 ID（自动更新元数据）
+        name: 可选，用于角色/道具名称，或分镜 ID（自动更新元数据）
+        on_conflict: source 类型独有 — fail / replace / rename
     """
     if upload_type not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=_t("invalid_upload_type", upload_type=upload_type))
@@ -101,6 +139,15 @@ async def upload_file(
         raise HTTPException(
             status_code=400,
             detail=_t("unsupported_image_type", ext=ext, allowed=", ".join(ALLOWED_EXTENSIONS[upload_type])),
+        )
+
+    # Source 分支早返 — 走 SourceLoader 规范化
+    if upload_type == "source":
+        return await _handle_source_upload(
+            project_name=project_name,
+            file=file,
+            on_conflict=on_conflict,
+            _t=_t,
         )
 
     try:
@@ -126,8 +173,14 @@ async def upload_file(
                     filename = f"{name}.png"
                 else:
                     filename = f"{Path(file.filename).stem}.png"
-            elif upload_type == "clue":
-                target_dir = project_dir / "clues"
+            elif upload_type == "scene":
+                target_dir = project_dir / "scenes"
+                if name:
+                    filename = f"{name}.png"
+                else:
+                    filename = f"{Path(file.filename).stem}.png"
+            elif upload_type == "prop":
+                target_dir = project_dir / "props"
                 if name:
                     filename = f"{name}.png"
                 else:
@@ -147,7 +200,7 @@ async def upload_file(
 
             # 保存文件（大于 2MB 时压缩为 JPEG，否则校验后原样保存）
             nonlocal content
-            if upload_type in ("character", "character_ref", "clue", "storyboard"):
+            if upload_type in ("character", "character_ref", "scene", "prop", "storyboard"):
                 try:
                     content, ext = normalize_uploaded_image(content, Path(file.filename).suffix.lower())
                 except ValueError:
@@ -165,8 +218,10 @@ async def upload_file(
                 relative_path = f"characters/{filename}"
             elif upload_type == "character_ref":
                 relative_path = f"characters/refs/{filename}"
-            elif upload_type == "clue":
-                relative_path = f"clues/{filename}"
+            elif upload_type == "scene":
+                relative_path = f"scenes/{filename}"
+            elif upload_type == "prop":
+                relative_path = f"props/{filename}"
             elif upload_type == "storyboard":
                 relative_path = f"storyboards/{filename}"
             else:
@@ -190,16 +245,27 @@ async def upload_file(
                 except KeyError:
                     pass  # 角色不存在，忽略
 
-            if upload_type == "clue" and name:
+            if upload_type == "scene" and name:
                 try:
                     with project_change_source("webui"):
-                        get_project_manager().update_clue_sheet(
+                        get_project_manager().update_scene_sheet(
                             project_name,
                             name,
-                            f"clues/{filename}",
+                            f"scenes/{filename}",
                         )
                 except KeyError:
-                    pass  # 线索不存在，忽略
+                    pass  # 场景不存在，忽略
+
+            if upload_type == "prop" and name:
+                try:
+                    with project_change_source("webui"):
+                        get_project_manager().update_prop_sheet(
+                            project_name,
+                            name,
+                            f"props/{filename}",
+                        )
+                except KeyError:
+                    pass  # 道具不存在，忽略
 
             return {
                 "success": True,
@@ -219,6 +285,105 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _handle_source_upload(
+    *,
+    project_name: str,
+    file: UploadFile,
+    on_conflict: str,
+    _t: Translator,
+):
+    """Source 分支：通过 SourceLoader 规范化为 UTF-8 .txt，并按需备份原始字节。"""
+    if on_conflict not in {"fail", "replace", "rename"}:
+        raise HTTPException(status_code=400, detail=_t("invalid_on_conflict"))
+
+    try:
+        project_dir = get_project_manager().get_project_path(project_name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))
+
+    source_dir = project_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    original_filename = file.filename
+
+    def _sync() -> NormalizeResult:
+        # 流式写入 tmp，避免把上传 body 整体拉进 Python 堆；
+        # UploadFile.file 是 SpooledTemporaryFile，此处已是请求体完整到位状态。
+        # 在 with 外包 try/finally：即使 copyfileobj 抛异常（如磁盘满），
+        # 也要清理已创建的 tmp 文件，避免 /tmp 泄漏（delete=False 不会自动清）。
+        with tempfile.NamedTemporaryFile(suffix=Path(original_filename).suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with tmp_path.open("wb") as out:
+                shutil.copyfileobj(file.file, out)
+            return SourceLoader.load(
+                tmp_path,
+                source_dir,
+                original_filename=original_filename,
+                on_conflict=on_conflict,
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    try:
+        result = await asyncio.to_thread(_sync)
+    except UnsupportedFormatError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=_t("source_unsupported_format", ext=exc.ext),
+        )
+    except FileSizeExceededError as exc:
+        raise HTTPException(
+            status_code=413,
+            detail=_t(
+                "source_too_large",
+                filename=exc.filename,
+                size_mb=round(exc.size_bytes / 1024 / 1024, 1),
+                limit_mb=round(exc.limit_bytes / 1024 / 1024, 1),
+            ),
+        )
+    except SourceDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_t(
+                "source_decode_failed",
+                filename=exc.filename,
+                tried=", ".join(exc.tried_encodings),
+            ),
+        )
+    except CorruptFileError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_t("source_corrupt_file", filename=exc.filename, reason=exc.reason),
+        )
+    except ConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "existing": exc.existing,
+                "suggested_name": exc.suggested_name,
+                "message": _t(
+                    "source_conflict",
+                    existing=exc.existing,
+                    suggested=exc.suggested_name,
+                ),
+            },
+        )
+
+    relative_path = f"source/{result.normalized_path.name}"
+    return {
+        "success": True,
+        "filename": result.normalized_path.name,
+        "path": relative_path,
+        "url": f"/api/v1/files/{project_name}/{relative_path}",
+        "normalized": True,
+        "original_kept": result.raw_path is not None,
+        "original_filename": result.original_filename,
+        "used_encoding": result.used_encoding,
+        "chapter_count": result.chapter_count,
+    }
+
+
 @router.get("/projects/{project_name}/files")
 async def list_project_files(project_name: str, _user: CurrentUser, _t: Translator):
     """列出项目中的所有文件"""
@@ -230,7 +395,8 @@ async def list_project_files(project_name: str, _user: CurrentUser, _t: Translat
             files = {
                 "source": [],
                 "characters": [],
-                "clues": [],
+                "scenes": [],
+                "props": [],
                 "storyboards": [],
                 "videos": [],
                 "output": [],
@@ -238,16 +404,27 @@ async def list_project_files(project_name: str, _user: CurrentUser, _t: Translat
 
             for subdir, file_list in files.items():
                 subdir_path = project_dir / subdir
-                if subdir_path.exists():
-                    for f in subdir_path.iterdir():
-                        if f.is_file() and not f.name.startswith("."):
-                            file_list.append(
-                                {
-                                    "name": f.name,
-                                    "size": f.stat().st_size,
-                                    "url": f"/api/v1/files/{project_name}/{subdir}/{f.name}",
-                                }
-                            )
+                if not subdir_path.exists():
+                    continue
+                # source 子目录额外列出 raw 备份映射
+                raw_by_stem: dict[str, str] = {}
+                if subdir == "source":
+                    raw_dir = subdir_path / "raw"
+                    if raw_dir.exists():
+                        # sorted 保证多个 raw 同 stem 时的确定性（后者覆盖前者，字典序末位胜出）
+                        for raw_f in sorted(raw_dir.iterdir()):
+                            if raw_f.is_file():
+                                raw_by_stem[raw_f.stem] = raw_f.name
+                for f in subdir_path.iterdir():
+                    if f.is_file() and not f.name.startswith("."):
+                        entry = {
+                            "name": f.name,
+                            "size": f.stat().st_size,
+                            "url": f"/api/v1/files/{project_name}/{subdir}/{f.name}",
+                        }
+                        if subdir == "source":
+                            entry["raw_filename"] = raw_by_stem.get(Path(f.name).stem)
+                        file_list.append(entry)
 
             return {"files": files}
 
@@ -350,6 +527,13 @@ async def delete_source_file(project_name: str, filename: str, _user: CurrentUse
 
             if source_path.exists():
                 source_path.unlink()
+                # 级联删除原文件备份（同 stem，任意扩展名）
+                raw_dir = project_dir / "source" / "raw"
+                if raw_dir.exists():
+                    stem = source_path.stem
+                    for raw_file in raw_dir.iterdir():
+                        if raw_file.is_file() and raw_file.stem == stem:
+                            raw_file.unlink()
                 return {"success": True}
             else:
                 raise HTTPException(status_code=404, detail=_t("file_not_found", path=filename))
@@ -602,6 +786,11 @@ async def upload_style_image(project_name: str, _user: CurrentUser, _t: Translat
             project_data = get_project_manager().load_project(project_name)
             project_data["style_image"] = style_filename
             project_data["style_description"] = style_description
+            # 强互斥：自定义参考图与模版二选一。除了清 template_id，
+            # 还需清掉之前由模板展开写入的 `style` prompt，否则生成链路会把
+            # 模板 prompt 与 style_description 同时喂给 LLM，破坏二选一语义。
+            project_data.pop("style_template_id", None)
+            project_data["style"] = ""
             with project_change_source("webui"):
                 get_project_manager().save_project(project_name, project_data)
 
@@ -613,70 +802,6 @@ async def upload_style_image(project_name: str, _user: CurrentUser, _t: Translat
             "style_description": style_description,
             "url": f"/api/v1/files/{project_name}/{style_filename}",
         }
-
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("请求处理失败")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/projects/{project_name}/style-image")
-async def delete_style_image(project_name: str, _user: CurrentUser, _t: Translator):
-    """
-    删除风格参考图及相关字段
-    """
-    try:
-
-        def _sync():
-            project_dir = get_project_manager().get_project_path(project_name)
-
-            # 删除图片文件（兼容所有可能的后缀）
-            for suffix in (".jpg", ".jpeg", ".png", ".webp"):
-                image_path = project_dir / f"style_reference{suffix}"
-                if image_path.exists():
-                    image_path.unlink()
-
-            # 清除 project.json 中的相关字段
-            project_data = get_project_manager().load_project(project_name)
-            project_data.pop("style_image", None)
-            project_data.pop("style_description", None)
-            with project_change_source("webui"):
-                get_project_manager().save_project(project_name, project_data)
-
-            return {"success": True}
-
-        return await asyncio.to_thread(_sync)
-
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("请求处理失败")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.patch("/projects/{project_name}/style-description")
-async def update_style_description(
-    project_name: str, _user: CurrentUser, _t: Translator, style_description: str = Body(..., embed=True)
-):
-    """
-    更新风格描述（手动编辑）
-    """
-    try:
-
-        def _sync():
-            project_data = get_project_manager().load_project(project_name)
-            project_data["style_description"] = style_description
-            with project_change_source("webui"):
-                get_project_manager().save_project(project_name, project_data)
-
-            return {"success": True, "style_description": style_description}
-
-        return await asyncio.to_thread(_sync)
 
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))

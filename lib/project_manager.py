@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import secrets
-import tempfile
 import unicodedata
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -20,12 +19,33 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from lib.asset_types import ASSET_SPECS
+from lib.json_io import atomic_write_json
 from lib.project_change_hints import emit_project_change_hint
+from lib.style_templates import LEGACY_STYLE_MAP, resolve_template_prompt
 
 logger = logging.getLogger(__name__)
 
 PROJECT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 PROJECT_SLUG_SANITIZER = re.compile(r"[^a-zA-Z0-9]+")
+
+_VALID_GENERATION_MODES = {"storyboard", "grid", "reference_video"}
+_DEFAULT_GENERATION_MODE = "storyboard"
+
+
+def effective_mode(*, project: dict, episode: dict) -> str:
+    """按 episode → project → 默认 storyboard 回退解析 generation_mode。
+
+    Spec §4.6。未知值一律回退到默认，兼容旧项目/脏数据。
+    """
+    ep_mode = episode.get("generation_mode")
+    if ep_mode in _VALID_GENERATION_MODES:
+        return ep_mode
+    proj_mode = project.get("generation_mode")
+    if proj_mode in _VALID_GENERATION_MODES:
+        return proj_mode
+    return _DEFAULT_GENERATION_MODE
+
 
 # ==================== 数据模型 ====================
 
@@ -48,7 +68,8 @@ class ProjectManager:
         "scripts",
         "drafts",
         "characters",
-        "clues",
+        "scenes",
+        "props",
         "storyboards",
         "videos",
         "thumbnails",
@@ -115,7 +136,15 @@ class ProjectManager:
 
     def list_projects(self) -> list[str]:
         """列出所有项目"""
-        return [d.name for d in self.projects_root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        return [d.name for d in self.projects_root.iterdir() if d.is_dir() and not d.name.startswith((".", "_"))]
+
+    def get_global_assets_root(self) -> Path:
+        """返回全局资产根目录，并确保 character/scene/prop 子目录存在。"""
+        root = self.projects_root / "_global_assets"
+        root.mkdir(parents=True, exist_ok=True)
+        for sub in ("character", "scene", "prop"):
+            (root / sub).mkdir(exist_ok=True)
+        return root
 
     def create_project(self, name: str) -> Path:
         """
@@ -247,7 +276,8 @@ class ProjectManager:
             "source_files": [],
             "scripts": [],
             "characters": [],
-            "clues": [],
+            "scenes": [],
+            "props": [],
             "storyboards": [],
             "videos": [],
             "outputs": [],
@@ -265,8 +295,10 @@ class ProjectManager:
                     status["scripts"] = [f.name for f in files if f.suffix == ".json"]
                 elif subdir == "characters":
                     status["characters"] = [f.name for f in files if f.suffix in [".png", ".jpg", ".jpeg"]]
-                elif subdir == "clues":
-                    status["clues"] = [f.name for f in files if f.suffix in [".png", ".jpg", ".jpeg"]]
+                elif subdir == "scenes":
+                    status["scenes"] = [f.name for f in files if f.suffix in [".png", ".jpg", ".jpeg"]]
+                elif subdir == "props":
+                    status["props"] = [f.name for f in files if f.suffix in [".png", ".jpg", ".jpeg"]]
                 elif subdir == "storyboards":
                     status["storyboards"] = [f.name for f in files if f.suffix in [".png", ".jpg", ".jpeg"]]
                 elif subdir == "videos":
@@ -382,7 +414,7 @@ class ProjectManager:
         output_path = Path(real)
 
         with self._script_lock(project_name, filename):
-            self._atomic_write_json(output_path, script)
+            atomic_write_json(output_path, script)
 
             # 在同一把锁内同步到 project.json，保证 script 写入与元数据同步是单一事务
             if self.project_exists(project_name) and isinstance(script.get("episode"), int):
@@ -537,7 +569,8 @@ class ProjectManager:
             "duration_seconds": duration_seconds,
             "segment_break": False,
             "characters_in_scene": [],
-            "clues_in_scene": [],
+            "scenes": [],
+            "props": [],
             "visual": {
                 "description": "",
                 "shot_type": "medium shot",
@@ -601,7 +634,8 @@ class ProjectManager:
             "scene_type": "剧情",
             "segment_break": False,
             "characters_in_scene": [],
-            "clues_in_scene": [],
+            "scenes": [],
+            "props": [],
             "action": "",
             "dialogue": template["dialogue"],
             "transition_to_next": "cut",
@@ -697,13 +731,7 @@ class ProjectManager:
             # sync_characters_from_script 会重新加载和保存 script，所以需要重新加载
             script = self.load_script(project_name, script_filename)
 
-        # 处理旧格式：如果有 clues 对象，同步到 project.json
-        if "clues" in script and isinstance(script["clues"], dict) and script["clues"]:
-            logger.warning("检测到旧格式 clues 对象，自动同步到 project.json")
-            self.sync_clues_from_script(project_name, script_filename)
-            script = self.load_script(project_name, script_filename)
-
-        # 注意：characters_in_episode 和 clues_in_episode 已改为读时计算
+        # 注意：characters_in_episode 已改为读时计算
         # 不再在 normalize_script 中创建这些字段
 
         if "scenes" not in script:
@@ -904,7 +932,7 @@ class ProjectManager:
 
     def get_character_path(self, project_name: str, filename: str) -> Path:
         """获取角色设计图路径"""
-        return self.get_project_path(project_name) / "characters" / filename
+        return self._get_asset_path("character", project_name, filename)
 
     def get_storyboard_path(self, project_name: str, filename: str) -> Path:
         """获取分镜图片路径"""
@@ -952,6 +980,24 @@ class ProjectManager:
         except FileNotFoundError:
             return False
 
+    @staticmethod
+    def _migrate_legacy_style(project: dict) -> bool:
+        """检测旧 style 值并就地迁移。返回是否发生了变更。"""
+        if "style_template_id" in project:
+            return False  # 已迁移
+        legacy_value = project.get("style", "")
+        if legacy_value not in LEGACY_STYLE_MAP:
+            return False
+        if project.get("style_image"):
+            # 参考图优先：清空旧 style、template_id 置 None
+            project["style_template_id"] = None
+            project["style"] = ""
+        else:
+            new_id = LEGACY_STYLE_MAP[legacy_value]
+            project["style_template_id"] = new_id
+            project["style"] = resolve_template_prompt(new_id)
+        return True
+
     def load_project(self, project_name: str) -> dict:
         """
         加载项目元数据
@@ -967,8 +1013,22 @@ class ProjectManager:
         if not project_file.exists():
             raise FileNotFoundError(f"项目元数据文件不存在: {project_file}")
 
-        with open(project_file, encoding="utf-8") as f:
-            return json.load(f)
+        migrated = False
+        with self._project_lock(project_name):
+            # 读-改-写放在同一把锁内，避免并发 save_project 在读与写之间完成
+            # 更新后，迁移写回又把更新覆盖掉（Codex #304 P2）。
+            with open(project_file, encoding="utf-8") as f:
+                project = json.load(f)
+            if self._migrate_legacy_style(project):
+                # 不走 save_project 以避免触发 _touch_metadata 污染 updated_at。
+                atomic_write_json(project_file, project)
+                migrated = True
+        if migrated:
+            emit_project_change_hint(
+                project_name,
+                changed_paths=[self.PROJECT_FILE],
+            )
+        return project
 
     @contextmanager
     def _project_lock(self, project_name: str):
@@ -1016,30 +1076,6 @@ class ProjectManager:
             fcntl.flock(fd, fcntl.LOCK_UN)
             fd.close()
 
-    @staticmethod
-    def _atomic_write_json(path: Path, data: dict) -> None:
-        """通过临时文件 + os.replace 原子写入 JSON。"""
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=".project.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                json.dump(data, tmp, ensure_ascii=False, indent=2)
-                tmp_path = Path(tmp.name)
-            os.replace(tmp_path, path)
-            tmp_path = None
-        finally:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-
     def save_project(self, project_name: str, project: dict) -> Path:
         """
         保存项目元数据
@@ -1056,7 +1092,7 @@ class ProjectManager:
         self._touch_metadata(project)
 
         with self._project_lock(project_name):
-            self._atomic_write_json(project_file, project)
+            atomic_write_json(project_file, project)
 
         emit_project_change_hint(
             project_name,
@@ -1085,7 +1121,7 @@ class ProjectManager:
                 project = json.load(f)
             mutate_fn(project)
             self._touch_metadata(project)
-            self._atomic_write_json(project_file, project)
+            atomic_write_json(project_file, project)
 
         emit_project_change_hint(
             project_name,
@@ -1110,32 +1146,31 @@ class ProjectManager:
         content_mode: str = "narration",
         aspect_ratio: str = "9:16",
         default_duration: int | None = None,
+        style_template_id: str | None = None,
+        extras: dict | None = None,
     ) -> dict:
         """
         创建新的项目元数据文件
 
-        Args:
-            project_name: 项目标识
-            title: 项目标题，留空时默认使用项目标识
-            style: 整体视觉风格描述
-            content_mode: 内容模式 ('narration' 或 'drama')
-            aspect_ratio: 视频宽高比（独立于 content_mode）
-            default_duration: 默认视频时长（秒），None 表示使用系统默认值
-
-        Returns:
-            项目元数据字典
+        `extras` 用于写入可选的模型/后端等字段（如 video_backend / image_backend /
+        text_backend_{script,overview,style}）。调用方负责剔除空值，本方法只按字面
+        写入 extras 中已有的键。
         """
         project_name = self.normalize_project_name(project_name)
         project_title = str(title).strip() if title is not None else ""
 
+        # schema_version 与 CURRENT_SCHEMA_VERSION 对齐，防止 v0→v1 迁移
+        # 在"新项目未含 clues 字段"时误清空已有的 scenes/props。
         project = {
+            "schema_version": 1,
             "title": project_title or project_name,
             "content_mode": content_mode,
             "aspect_ratio": aspect_ratio,
             "style": style or "",
             "episodes": [],
             "characters": {},
-            "clues": {},
+            "scenes": {},
+            "props": {},
             "metadata": {
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
@@ -1143,6 +1178,10 @@ class ProjectManager:
         }
         if default_duration is not None:
             project["default_duration"] = default_duration
+        if style_template_id is not None:
+            project["style_template_id"] = style_template_id
+        if extras:
+            project.update(extras)
 
         self.save_project(project_name, project)
         return project
@@ -1204,6 +1243,103 @@ class ProjectManager:
         # 仅返回项目数据，不执行任何写入
         return self.load_project(project_name)
 
+    # ==================== 项目级资产统一 API（character / scene / prop） ====================
+    #
+    # 这一节的 6 个私有方法按 lib.asset_types.ASSET_SPECS 驱动，统一处理 character /
+    # scene / prop 三类项目级资产的桶级读写。下方的 public 方法（add_project_scene /
+    # add_prop / get_scene / update_*_sheet 等）全部委托给这些私有方法，签名与异常
+    # 100% 兼容旧调用方。
+
+    def _add_asset(self, asset_type: str, project_name: str, name: str, entry: dict) -> bool:
+        """新增 entry 到 project[bucket][name]。冲突时返回 False。
+
+        通过 update_project 在单一文件锁内完成 read-modify-write，避免并发新增时的
+        lost-update 竞态。
+        """
+        spec = ASSET_SPECS[asset_type]
+        added = False
+
+        def _mutate(project):
+            nonlocal added
+            bucket = project.setdefault(spec.bucket_key, {})
+            if name in bucket:
+                logger.debug("%s '%s' 已存在于 project.json，跳过", spec.label_zh, name)
+                return
+            bucket[name] = entry
+            added = True
+
+        self.update_project(project_name, _mutate)
+        if added:
+            logger.info("添加%s: %s", spec.label_zh, name)
+        return added
+
+    def _add_assets_batch(self, asset_type: str, project_name: str, entries: dict[str, dict]) -> int:
+        """批量新增 entries。已存在的 name 跳过，返回新增数量。
+
+        通过 update_project 在单一文件锁内完成 read-modify-write，避免并发批量新增时
+        的 lost-update 竞态。
+        """
+        spec = ASSET_SPECS[asset_type]
+        added = 0
+
+        def _mutate(project):
+            nonlocal added
+            bucket = project.setdefault(spec.bucket_key, {})
+            for name, entry in entries.items():
+                if name in bucket:
+                    logger.debug("%s '%s' 已存在，跳过", spec.label_zh, name)
+                    continue
+                bucket[name] = entry
+                added += 1
+                logger.info("添加%s: %s", spec.label_zh, name)
+
+        if entries:
+            self.update_project(project_name, _mutate)
+        return added
+
+    def _update_asset_sheet(self, asset_type: str, project_name: str, name: str, sheet_path: str) -> dict:
+        """更新资产 sheet 字段路径。资产不存在抛 KeyError。
+
+        通过 update_project 在单一文件锁内完成 read-modify-write，避免与并发 add /
+        update 任务的 lost-update 竞态。
+        """
+        spec = ASSET_SPECS[asset_type]
+
+        def _mutate(project):
+            bucket = project.get(spec.bucket_key)
+            if bucket is None or name not in bucket:
+                raise KeyError(f"{spec.label_zh} '{name}' 不存在")
+            bucket[name][spec.sheet_field] = sheet_path
+
+        self.update_project(project_name, _mutate)
+        return self.load_project(project_name)
+
+    def _get_asset(self, asset_type: str, project_name: str, name: str) -> dict:
+        """获取资产定义。不存在抛 KeyError。"""
+        spec = ASSET_SPECS[asset_type]
+        project = self.load_project(project_name)
+        bucket = project.get(spec.bucket_key)
+        if bucket is None or name not in bucket:
+            raise KeyError(f"{spec.label_zh} '{name}' 不存在")
+        return bucket[name]
+
+    def _get_pending_assets(self, asset_type: str, project_name: str) -> list[dict]:
+        """无 sheet 字段或 sheet 文件不存在的资产列表。"""
+        spec = ASSET_SPECS[asset_type]
+        project = self.load_project(project_name)
+        project_dir = self.get_project_path(project_name)
+        pending = []
+        for name, entry in (project.get(spec.bucket_key) or {}).items():
+            sheet = entry.get(spec.sheet_field)
+            if not sheet or not (project_dir / sheet).exists():
+                pending.append({"name": name, **entry})
+        return pending
+
+    def _get_asset_path(self, asset_type: str, project_name: str, filename: str) -> Path:
+        """获取资产文件在项目目录下的绝对路径。"""
+        spec = ASSET_SPECS[asset_type]
+        return self.get_project_path(project_name) / spec.subdir / filename
+
     # ==================== 项目级角色管理 ====================
 
     def add_project_character(
@@ -1240,14 +1376,7 @@ class ProjectManager:
 
     def update_project_character_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
         """更新项目级角色设计图路径"""
-        project = self.load_project(project_name)
-
-        if name not in project["characters"]:
-            raise KeyError(f"角色 '{name}' 不存在")
-
-        project["characters"][name]["character_sheet"] = sheet_path
-        self.save_project(project_name, project)
-        return project
+        return self._update_asset_sheet("character", project_name, name, sheet_path)
 
     def update_character_reference_image(self, project_name: str, char_name: str, ref_path: str) -> dict:
         """
@@ -1272,248 +1401,100 @@ class ProjectManager:
 
     def get_project_character(self, project_name: str, name: str) -> dict:
         """获取项目级角色定义"""
-        project = self.load_project(project_name)
+        return self._get_asset("character", project_name, name)
 
-        if name not in project["characters"]:
-            raise KeyError(f"角色 '{name}' 不存在")
+    # ==================== 场景管理（scene） ====================
 
-        return project["characters"][name]
+    def update_scene_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
+        """更新场景设计图路径"""
+        return self._update_asset_sheet("scene", project_name, name, sheet_path)
 
-    # ==================== 线索管理 ====================
+    def get_scene(self, project_name: str, name: str) -> dict:
+        """获取场景定义"""
+        return self._get_asset("scene", project_name, name)
 
-    def update_clue_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
-        """
-        更新线索设计图路径
+    def get_pending_project_scenes(self, project_name: str) -> list[dict]:
+        """无 scene_sheet 或文件不存在的场景。"""
+        return self._get_pending_assets("scene", project_name)
 
-        Args:
-            project_name: 项目名称
-            name: 线索名称
-            sheet_path: 设计图路径
+    def get_scene_path(self, project_name: str, filename: str) -> Path:
+        """获取场景设计图路径"""
+        return self._get_asset_path("scene", project_name, filename)
 
-        Returns:
-            更新后的项目元数据
-        """
-        project = self.load_project(project_name)
+    # ==================== 道具管理（prop） ====================
 
-        if name not in project["clues"]:
-            raise KeyError(f"线索 '{name}' 不存在")
+    def update_prop_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
+        """更新道具设计图路径"""
+        return self._update_asset_sheet("prop", project_name, name, sheet_path)
 
-        project["clues"][name]["clue_sheet"] = sheet_path
-        self.save_project(project_name, project)
-        return project
+    def get_prop(self, project_name: str, name: str) -> dict:
+        """获取道具定义"""
+        return self._get_asset("prop", project_name, name)
 
-    def get_clue(self, project_name: str, name: str) -> dict:
-        """
-        获取线索定义
+    def get_pending_project_props(self, project_name: str) -> list[dict]:
+        """无 prop_sheet 或文件不存在的道具。"""
+        return self._get_pending_assets("prop", project_name)
 
-        Args:
-            project_name: 项目名称
-            name: 线索名称
-
-        Returns:
-            线索定义字典
-        """
-        project = self.load_project(project_name)
-
-        if name not in project["clues"]:
-            raise KeyError(f"线索 '{name}' 不存在")
-
-        return project["clues"][name]
+    def get_prop_path(self, project_name: str, filename: str) -> Path:
+        """获取道具设计图路径"""
+        return self._get_asset_path("prop", project_name, filename)
 
     def get_pending_characters(self, project_name: str) -> list[dict]:
+        """获取待生成设计图的角色列表（无 character_sheet 或文件不存在）"""
+        return self._get_pending_assets("character", project_name)
+
+    # ==================== 角色/场景/道具直接写入工具 ====================
+
+    @staticmethod
+    def _build_asset_entry(asset_type: str, description: str, source: dict | None = None) -> dict:
+        """按 ASSET_SPECS 构造 entry：description + sheet 字段为空 + extra 字段从 source 取或默认 ''。
+
+        source 为 None 时（add_character 等单条新增），仅写入 spec 中声明的 extra 字段
+        默认空串；source 提供时（batch 新增），同时允许覆盖 sheet 字段。
         """
-        获取待生成设计图的角色列表
-
-        Args:
-            project_name: 项目名称
-
-        Returns:
-            待处理角色列表（无 character_sheet 或文件不存在）
-        """
-        project = self.load_project(project_name)
-        project_dir = self.get_project_path(project_name)
-
-        pending = []
-        for name, char in project.get("characters", {}).items():
-            sheet = char.get("character_sheet")
-            if not sheet or not (project_dir / sheet).exists():
-                pending.append({"name": name, **char})
-
-        return pending
-
-    def get_pending_clues(self, project_name: str) -> list[dict]:
-        """
-        获取待生成设计图的线索列表
-
-        Args:
-            project_name: 项目名称
-
-        Returns:
-            待处理线索列表（importance='major' 且无 clue_sheet）
-        """
-        project = self.load_project(project_name)
-        project_dir = self.get_project_path(project_name)
-
-        pending = []
-        for name, clue in project["clues"].items():
-            if clue.get("importance") == "major":
-                sheet = clue.get("clue_sheet")
-                if not sheet or not (project_dir / sheet).exists():
-                    pending.append({"name": name, **clue})
-
-        return pending
-
-    def get_clue_path(self, project_name: str, filename: str) -> Path:
-        """获取线索设计图路径"""
-        return self.get_project_path(project_name) / "clues" / filename
-
-    # ==================== 角色/线索直接写入工具 ====================
+        spec = ASSET_SPECS[asset_type]
+        data = source or {}
+        entry: dict = {"description": description, spec.sheet_field: data.get(spec.sheet_field, "")}
+        for field in spec.extra_string_fields:
+            entry[field] = data.get(field, "")
+        return entry
 
     def add_character(self, project_name: str, name: str, description: str, voice_style: str = "") -> bool:
-        """
-        直接添加角色到 project.json
+        """直接添加角色到 project.json。已存在返回 False。"""
+        entry = self._build_asset_entry("character", description, {"voice_style": voice_style})
+        return self._add_asset("character", project_name, name, entry)
 
-        如果角色已存在，跳过不覆盖。
+    def add_project_scene(self, project_name: str, name: str, description: str) -> bool:
+        """直接添加场景到 project.json。已存在返回 False。"""
+        entry = self._build_asset_entry("scene", description)
+        return self._add_asset("scene", project_name, name, entry)
 
-        Args:
-            project_name: 项目名称
-            name: 角色名称
-            description: 角色描述
-            voice_style: 声音风格（可选）
-
-        Returns:
-            True 如果新增成功，False 如果已存在
-        """
-        project = self.load_project(project_name)
-
-        if name in project.get("characters", {}):
-            logger.debug("角色 '%s' 已存在于 project.json，跳过", name)
-            return False
-
-        if "characters" not in project:
-            project["characters"] = {}
-
-        project["characters"][name] = {
-            "description": description,
-            "character_sheet": "",
-            "voice_style": voice_style,
-        }
-
-        self.save_project(project_name, project)
-        logger.info("添加角色: %s", name)
-        return True
-
-    def add_clue(
-        self,
-        project_name: str,
-        name: str,
-        clue_type: str,
-        description: str,
-        importance: str = "minor",
-    ) -> bool:
-        """
-        直接添加线索到 project.json
-
-        如果线索已存在，跳过不覆盖。
-
-        Args:
-            project_name: 项目名称
-            name: 线索名称
-            clue_type: 线索类型（prop 或 location）
-            description: 线索描述
-            importance: 重要性（major 或 minor，默认 minor）
-
-        Returns:
-            True 如果新增成功，False 如果已存在
-        """
-        project = self.load_project(project_name)
-
-        if name in project.get("clues", {}):
-            logger.debug("线索 '%s' 已存在于 project.json，跳过", name)
-            return False
-
-        if "clues" not in project:
-            project["clues"] = {}
-
-        project["clues"][name] = {
-            "type": clue_type,
-            "description": description,
-            "importance": importance,
-            "clue_sheet": "",
-        }
-
-        self.save_project(project_name, project)
-        logger.info("添加线索: %s", name)
-        return True
+    def add_prop(self, project_name: str, name: str, description: str) -> bool:
+        """直接添加道具到 project.json。已存在返回 False。"""
+        entry = self._build_asset_entry("prop", description)
+        return self._add_asset("prop", project_name, name, entry)
 
     def add_characters_batch(self, project_name: str, characters: dict[str, dict]) -> int:
-        """
-        批量添加角色到 project.json
+        """批量添加角色到 project.json。已存在的跳过，返回新增数量。"""
+        entries = {
+            name: self._build_asset_entry("character", data.get("description", ""), data)
+            for name, data in characters.items()
+        }
+        return self._add_assets_batch("character", project_name, entries)
 
-        Args:
-            project_name: 项目名称
-            characters: 角色字典 {name: {description, voice_style}}
+    def add_scenes_batch(self, project_name: str, scenes: dict[str, dict]) -> int:
+        """批量添加场景到 project.json。已存在的跳过，返回新增数量。"""
+        entries = {
+            name: self._build_asset_entry("scene", data.get("description", ""), data) for name, data in scenes.items()
+        }
+        return self._add_assets_batch("scene", project_name, entries)
 
-        Returns:
-            新增的角色数量
-        """
-        project = self.load_project(project_name)
-
-        if "characters" not in project:
-            project["characters"] = {}
-
-        added = 0
-        for name, data in characters.items():
-            if name not in project["characters"]:
-                project["characters"][name] = {
-                    "description": data.get("description", ""),
-                    "character_sheet": data.get("character_sheet", ""),
-                    "voice_style": data.get("voice_style", ""),
-                }
-                added += 1
-                logger.info("添加角色: %s", name)
-            else:
-                logger.debug("角色 '%s' 已存在，跳过", name)
-
-        if added > 0:
-            self.save_project(project_name, project)
-
-        return added
-
-    def add_clues_batch(self, project_name: str, clues: dict[str, dict]) -> int:
-        """
-        批量添加线索到 project.json
-
-        Args:
-            project_name: 项目名称
-            clues: 线索字典 {name: {type, description, importance}}
-
-        Returns:
-            新增的线索数量
-        """
-        project = self.load_project(project_name)
-
-        if "clues" not in project:
-            project["clues"] = {}
-
-        added = 0
-        for name, data in clues.items():
-            if name not in project["clues"]:
-                project["clues"][name] = {
-                    "type": data.get("type", "prop"),
-                    "description": data.get("description", ""),
-                    "importance": data.get("importance", "minor"),
-                    "clue_sheet": data.get("clue_sheet", ""),
-                }
-                added += 1
-                logger.info("添加线索: %s", name)
-            else:
-                logger.debug("线索 '%s' 已存在，跳过", name)
-
-        if added > 0:
-            self.save_project(project_name, project)
-
-        return added
+    def add_props_batch(self, project_name: str, props: dict[str, dict]) -> int:
+        """批量添加道具到 project.json。已存在的跳过，返回新增数量。"""
+        entries = {
+            name: self._build_asset_entry("prop", data.get("description", ""), data) for name, data in props.items()
+        }
+        return self._add_assets_batch("prop", project_name, entries)
 
     # ==================== 参考图收集工具 ====================
 
@@ -1541,10 +1522,10 @@ class ProjectManager:
                 if sheet_path.exists():
                     refs.append(sheet_path)
 
-        # 线索参考图
-        for clue in scene.get("clues_in_scene", []):
-            clue_data = project["clues"].get(clue, {})
-            sheet = clue_data.get("clue_sheet")
+        # 道具参考图
+        for prop in scene.get("props_in_scene", []):
+            prop_data = project.get("props", {}).get(prop, {})
+            sheet = prop_data.get("prop_sheet")
             if sheet:
                 sheet_path = project_dir / sheet
                 if sheet_path.exists():
@@ -1556,15 +1537,14 @@ class ProjectManager:
 
     def _read_source_files(self, project_name: str, max_chars: int = 50000) -> str:
         """
-        读取项目 source 目录下的所有文本文件内容
+        读取项目 source 目录下的所有 UTF-8 文本文件内容。
 
-        Args:
-            project_name: 项目名称
-            max_chars: 最大读取字符数（避免超出 API 限制）
-
-        Returns:
-            合并后的文本内容
+        非 UTF-8 文件会抛 SourceDecodeError —— 上传路径已统一规范化为 UTF-8，
+        启动迁移已修历史项目；这里若仍遇到非 UTF-8，说明用户绕过 API 直接拷贝
+        文件，需显式报错而非"源目录为空"误导。
         """
+        from .source_loader.errors import SourceDecodeError
+
         project_dir = self.get_project_path(project_name)
         source_dir = project_dir / "source"
 
@@ -1573,22 +1553,26 @@ class ProjectManager:
 
         contents = []
         total_chars = 0
-
-        # 按文件名排序，确保顺序一致
         for file_path in sorted(source_dir.glob("*")):
-            if file_path.is_file() and file_path.suffix.lower() in [".txt", ".md"]:
-                try:
-                    with open(file_path, encoding="utf-8") as f:
-                        content = f.read()
-                        remaining = max_chars - total_chars
-                        if remaining <= 0:
-                            break
-                        if len(content) > remaining:
-                            content = content[:remaining]
-                        contents.append(f"--- {file_path.name} ---\n{content}")
-                        total_chars += len(content)
-                except Exception as e:
-                    logger.error("读取文件失败 %s: %s", file_path.name, e)
+            if not (file_path.is_file() and file_path.suffix.lower() in [".txt", ".md"]):
+                continue
+
+            raw = file_path.read_bytes()
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise SourceDecodeError(
+                    filename=file_path.name,
+                    tried_encodings=["utf-8"],
+                ) from exc
+
+            remaining = max_chars - total_chars
+            if remaining <= 0:
+                break
+            if len(content) > remaining:
+                content = content[:remaining]
+            contents.append(f"--- {file_path.name} ---\n{content}")
+            total_chars += len(content)
 
         return "\n\n".join(contents)
 

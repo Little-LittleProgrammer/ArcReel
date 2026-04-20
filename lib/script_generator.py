@@ -13,13 +13,21 @@ from typing import Optional
 from pydantic import ValidationError
 
 from lib.config.registry import PROVIDER_REGISTRY
+from lib.project_manager import effective_mode
+from lib.prompt_builders_reference import build_reference_video_prompt
 from lib.prompt_builders_script import (
     build_drama_prompt,
     build_narration_prompt,
 )
+from lib.reference_video.limits import (
+    DEFAULT_MAX_REFS,
+    PROVIDER_MAX_REFS,
+    normalize_provider_id,
+)
 from lib.script_models import (
     DramaEpisodeScript,
     NarrationEpisodeScript,
+    ReferenceVideoScript,
 )
 from lib.text_backends.base import TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
@@ -53,6 +61,14 @@ class ScriptGenerator:
         self.project_json = self._load_project_json()
         self.content_mode = self.project_json.get("content_mode", "narration")
 
+    def _effective_generation_mode(self, episode: int) -> str:
+        """按 Spec §4.6 解析集级 → 项目级 generation_mode，未知值回退 storyboard。"""
+        episode_dict = next(
+            (ep for ep in (self.project_json.get("episodes") or []) if ep.get("episode") == episode),
+            {},
+        )
+        return effective_mode(project=self.project_json, episode=episode_dict)
+
     @classmethod
     async def create(cls, project_path: str | Path) -> "ScriptGenerator":
         """异步工厂方法，自动从 DB 加载供应商配置创建 TextGenerator。"""
@@ -78,21 +94,39 @@ class ScriptGenerator:
         if self.generator is None:
             raise RuntimeError("TextGenerator 未初始化，请使用 ScriptGenerator.create() 工厂方法")
 
+        gen_mode = self._effective_generation_mode(episode)
+
         # 1. 加载中间文件
         step1_md = self._load_step1(episode)
 
-        # 2. 提取角色和线索（从 project.json）
+        # 2. 提取角色、场景、道具（从 project.json）
         characters = self.project_json.get("characters", {})
-        clues = self.project_json.get("clues", {})
+        scenes = self.project_json.get("scenes", {})
+        props = self.project_json.get("props", {})
 
         # 3. 构建 Prompt
-        if self.content_mode == "narration":
+        if gen_mode == "reference_video":
+            prompt = build_reference_video_prompt(
+                project_overview=self.project_json.get("overview", {}),
+                style=self.project_json.get("style", ""),
+                style_description=self.project_json.get("style_description", ""),
+                characters=characters,
+                scenes=scenes,
+                props=props,
+                units_md=step1_md,
+                supported_durations=self._resolve_supported_durations() or [4, 8],
+                max_refs=self._resolve_max_refs(),
+                aspect_ratio=self._resolve_aspect_ratio(),
+            )
+            schema = ReferenceVideoScript
+        elif self.content_mode == "narration":
             prompt = build_narration_prompt(
                 project_overview=self.project_json.get("overview", {}),
                 style=self.project_json.get("style", ""),
                 style_description=self.project_json.get("style_description", ""),
                 characters=characters,
-                clues=clues,
+                scenes=scenes,
+                props=props,
                 segments_md=step1_md,
                 supported_durations=self._resolve_supported_durations(),
                 default_duration=self.project_json.get("default_duration"),
@@ -105,7 +139,8 @@ class ScriptGenerator:
                 style=self.project_json.get("style", ""),
                 style_description=self.project_json.get("style_description", ""),
                 characters=characters,
-                clues=clues,
+                scenes=scenes,
+                props=props,
                 scenes_md=step1_md,
                 supported_durations=self._resolve_supported_durations(),
                 default_duration=self.project_json.get("default_duration"),
@@ -153,17 +188,33 @@ class ScriptGenerator:
         Returns:
             构建好的 Prompt 字符串
         """
+        gen_mode = self._effective_generation_mode(episode)
         step1_md = self._load_step1(episode)
         characters = self.project_json.get("characters", {})
-        clues = self.project_json.get("clues", {})
+        scenes = self.project_json.get("scenes", {})
+        props = self.project_json.get("props", {})
 
-        if self.content_mode == "narration":
+        if gen_mode == "reference_video":
+            return build_reference_video_prompt(
+                project_overview=self.project_json.get("overview", {}),
+                style=self.project_json.get("style", ""),
+                style_description=self.project_json.get("style_description", ""),
+                characters=characters,
+                scenes=scenes,
+                props=props,
+                units_md=step1_md,
+                supported_durations=self._resolve_supported_durations() or [4, 8],
+                max_refs=self._resolve_max_refs(),
+                aspect_ratio=self._resolve_aspect_ratio(),
+            )
+        elif self.content_mode == "narration":
             return build_narration_prompt(
                 project_overview=self.project_json.get("overview", {}),
                 style=self.project_json.get("style", ""),
                 style_description=self.project_json.get("style_description", ""),
                 characters=characters,
-                clues=clues,
+                scenes=scenes,
+                props=props,
                 segments_md=step1_md,
                 supported_durations=self._resolve_supported_durations(),
                 default_duration=self.project_json.get("default_duration"),
@@ -175,7 +226,8 @@ class ScriptGenerator:
                 style=self.project_json.get("style", ""),
                 style_description=self.project_json.get("style_description", ""),
                 characters=characters,
-                clues=clues,
+                scenes=scenes,
+                props=props,
                 scenes_md=step1_md,
                 supported_durations=self._resolve_supported_durations(),
                 default_duration=self.project_json.get("default_duration"),
@@ -203,6 +255,13 @@ class ScriptGenerator:
             return self.project_json["aspect_ratio"]
         return "9:16" if self.content_mode == "narration" else "16:9"
 
+    def _resolve_max_refs(self) -> int:
+        """按 provider 粗粒度解析最大参考图数。数值来源：`lib.reference_video.limits`。"""
+        video_backend = self.project_json.get("video_backend") or ""
+        raw_provider = video_backend.split("/", 1)[0] if "/" in video_backend else ""
+        provider_id = normalize_provider_id(raw_provider)
+        return PROVIDER_MAX_REFS.get(provider_id, DEFAULT_MAX_REFS)
+
     def _load_project_json(self) -> dict:
         """加载 project.json"""
         path = self.project_path / "project.json"
@@ -215,7 +274,11 @@ class ScriptGenerator:
     def _load_step1(self, episode: int) -> str:
         """加载 Step 1 的 Markdown 文件，支持两种文件命名"""
         drafts_path = self.project_path / "drafts" / f"episode_{episode}"
-        if self.content_mode == "narration":
+        gen_mode = self._effective_generation_mode(episode)
+        if gen_mode == "reference_video":
+            primary_path = drafts_path / "step1_reference_units.md"
+            fallback_path = None
+        elif self.content_mode == "narration":
             primary_path = drafts_path / "step1_segments.md"
             fallback_path = drafts_path / "step1_normalized_script.md"
         else:
@@ -223,7 +286,7 @@ class ScriptGenerator:
             fallback_path = drafts_path / "step1_segments.md"
 
         if not primary_path.exists():
-            if fallback_path.exists():
+            if fallback_path is not None and fallback_path.exists():
                 logger.warning("未找到 Step 1 文件: %s，改用 %s", primary_path, fallback_path)
                 primary_path = fallback_path
             else:
@@ -265,7 +328,9 @@ class ScriptGenerator:
 
         # Pydantic 验证
         try:
-            if self.content_mode == "narration":
+            if self._effective_generation_mode(episode) == "reference_video":
+                validated = ReferenceVideoScript.model_validate(data)
+            elif self.content_mode == "narration":
                 validated = NarrationEpisodeScript.model_validate(data)
             else:
                 validated = DramaEpisodeScript.model_validate(data)
@@ -317,9 +382,13 @@ class ScriptGenerator:
         Returns:
             补充元数据后的剧本数据
         """
+        gen_mode = self._effective_generation_mode(episode)
         # 确保基本字段存在
         script_data.setdefault("episode", episode)
-        script_data.setdefault("content_mode", self.content_mode)
+        if gen_mode == "reference_video":
+            script_data["content_mode"] = "reference_video"
+        else:
+            script_data.setdefault("content_mode", self.content_mode)
 
         # 添加小说信息
         if "novel" not in script_data:
@@ -339,29 +408,21 @@ class ScriptGenerator:
         script_data["metadata"]["updated_at"] = now
         script_data["metadata"]["generator"] = self.generator.model if self.generator else "unknown"
 
-        # 计算统计信息 + 聚合 episode 级角色/线索（从 segment/scene 中收集）
-        if self.content_mode == "narration":
+        # 计算统计信息（episode 级角色/场景/道具聚合由 StatusCalculator 读时计算）
+        if gen_mode == "reference_video":
+            units = script_data.get("video_units", [])
+            script_data["metadata"]["total_units"] = len(units)
+            script_data["duration_seconds"] = sum(int(u.get("duration_seconds", 0)) for u in units)
+        elif self.content_mode == "narration":
             segments = script_data.get("segments", [])
             script_data["metadata"]["total_segments"] = len(segments)
             script_data["duration_seconds"] = sum(int(s.get("duration_seconds", 4)) for s in segments)
-            chars_field, clues_field = "characters_in_segment", "clues_in_segment"
-            items = segments
         else:
             scenes = script_data.get("scenes", [])
             script_data["metadata"]["total_scenes"] = len(scenes)
             script_data["duration_seconds"] = sum(int(s.get("duration_seconds", 8)) for s in scenes)
-            chars_field, clues_field = "characters_in_scene", "clues_in_scene"
-            items = scenes
 
-        all_chars: set[str] = set()
-        all_clues: set[str] = set()
-        for item in items:
-            for name in item.get(chars_field, []):
-                if isinstance(name, str):
-                    all_chars.add(name)
-            for name in item.get(clues_field, []):
-                if isinstance(name, str):
-                    all_clues.add(name)
+        # 剥离废弃的 episode 级聚合字段（改为读时计算）
         script_data.pop("characters_in_episode", None)
         script_data.pop("clues_in_episode", None)
 

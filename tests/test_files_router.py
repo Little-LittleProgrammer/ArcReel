@@ -45,7 +45,7 @@ def _client(monkeypatch, tmp_path):
     pm.create_project("demo")
     pm.create_project_metadata("demo", "Demo", "Anime", "narration")
     pm.add_character("demo", "Alice", "desc")
-    pm.add_clue("demo", "玉佩", "prop", "desc", "major")
+    pm.add_prop("demo", "玉佩", "古玉")
 
     monkeypatch.setattr(files, "get_project_manager", lambda: pm)
     monkeypatch.setattr("lib.text_generator.create_text_backend_for_task", _fake_create_backend)
@@ -113,11 +113,11 @@ class TestFilesRouter:
             assert character_ref.json()["path"] == "characters/refs/Alice.webp"
 
             clue = client.post(
-                "/api/v1/projects/demo/upload/clue?name=玉佩",
-                files={"file": ("clue.jpg", _img_bytes("JPEG"), "image/jpeg")},
+                "/api/v1/projects/demo/upload/prop?name=玉佩",
+                files={"file": ("prop.jpg", _img_bytes("JPEG"), "image/jpeg")},
             )
             assert clue.status_code == 200
-            assert clue.json()["path"] == "clues/玉佩.jpg"
+            assert clue.json()["path"] == "props/玉佩.jpg"
 
             storyboard = client.post(
                 "/api/v1/projects/demo/upload/storyboard?name=E1S01",
@@ -170,14 +170,20 @@ class TestFilesRouter:
             missing_draft = client.get("/api/v1/projects/demo/drafts/1/step1")
             assert missing_draft.status_code == 404
 
-            # confirm metadata updated for character/clue
+            # confirm metadata updated for character/prop
             project = pm.load_project("demo")
             assert project["characters"]["Alice"]["character_sheet"] == "characters/Alice.jpg"
             assert project["characters"]["Alice"]["reference_image"] == "characters/refs/Alice.webp"
-            assert project["clues"]["玉佩"]["clue_sheet"] == "clues/玉佩.jpg"
+            assert project["props"]["玉佩"]["prop_sheet"] == "props/玉佩.jpg"
 
     def test_style_image_endpoints(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
+
+        # 预置 style_template_id + 展开后的 style prompt，验证上传后被强制清掉（互斥）
+        project = pm.load_project("demo")
+        project["style_template_id"] = "live_premium_drama"
+        project["style"] = "画风：真人电视剧风格，精品短剧画风，大师级构图"
+        pm.save_project("demo", project)
 
         with client:
             upload_style = client.post(
@@ -186,20 +192,12 @@ class TestFilesRouter:
             )
             assert upload_style.status_code == 200
             assert upload_style.json()["style_description"] == "cinematic, high contrast"
-
-            patch_style = client.patch(
-                "/api/v1/projects/demo/style-description",
-                json={"style_description": "manual style"},
-            )
-            assert patch_style.status_code == 200
-            assert patch_style.json()["style_description"] == "manual style"
-
-            delete_style = client.delete("/api/v1/projects/demo/style-image")
-            assert delete_style.status_code == 200
-
-            project = pm.load_project("demo")
-            assert "style_image" not in project
-            assert "style_description" not in project
+            after = pm.load_project("demo")
+            assert after.get("style_image", "").startswith("style_reference")
+            assert "style_template_id" not in after
+            # 互斥语义关键断言：模板展开到 style 的 prompt 也要被清空，
+            # 否则生成链路会把模板 prompt 与 style_description 一起喂给 LLM。
+            assert after.get("style", "") == ""
 
             bad_style_ext = client.post(
                 "/api/v1/projects/demo/style-image",
@@ -227,9 +225,6 @@ class TestFilesRouter:
             )
             assert missing_source.status_code == 404
 
-            style_missing_project = client.delete("/api/v1/projects/missing/style-image")
-            assert style_missing_project.status_code == 404
-
     def test_upload_without_name_and_keyerror_tolerance(self, tmp_path, monkeypatch):
         client, _ = _client(monkeypatch, tmp_path)
         with client:
@@ -241,11 +236,11 @@ class TestFilesRouter:
             assert ref_no_name.json()["path"] == "characters/refs/no_name.jpg"
 
             clue_missing_entity = client.post(
-                "/api/v1/projects/demo/upload/clue?name=不存在线索",
+                "/api/v1/projects/demo/upload/prop?name=不存在道具",
                 files={"file": ("x.jpg", _img_bytes("JPEG"), "image/jpeg")},
             )
             assert clue_missing_entity.status_code == 200
-            assert clue_missing_entity.json()["path"] == "clues/不存在线索.jpg"
+            assert clue_missing_entity.json()["path"] == "props/不存在道具.jpg"
 
             character_missing_entity = client.post(
                 "/api/v1/projects/demo/upload/character?name=不存在角色",
@@ -393,3 +388,217 @@ class TestFilesRouter:
             change2 = mock_emit.call_args[0][1][0]
             assert change2["action"] == "updated"
             assert change2["important"] is False
+
+    def test_serve_global_asset_image(self, tmp_path, monkeypatch):
+        """全局资产图片能够被正确读取返回"""
+        client, pm = _client(monkeypatch, tmp_path)
+        target = pm.get_global_assets_root() / "character" / "abc.png"
+        target.write_bytes(b"img-bytes")
+
+        with client:
+            resp = client.get("/api/v1/global-assets/character/abc.png")
+            assert resp.status_code == 200
+            assert resp.content == b"img-bytes"
+
+    def test_serve_global_asset_scene_and_prop(self, tmp_path, monkeypatch):
+        """scene/prop 子目录也能正确读取"""
+        client, pm = _client(monkeypatch, tmp_path)
+        root = pm.get_global_assets_root()
+        (root / "scene" / "s.png").write_bytes(b"scene-bytes")
+        (root / "prop" / "p.png").write_bytes(b"prop-bytes")
+
+        with client:
+            r_scene = client.get("/api/v1/global-assets/scene/s.png")
+            assert r_scene.status_code == 200
+            assert r_scene.content == b"scene-bytes"
+
+            r_prop = client.get("/api/v1/global-assets/prop/p.png")
+            assert r_prop.status_code == 200
+            assert r_prop.content == b"prop-bytes"
+
+    def test_global_asset_invalid_type_returns_400(self, tmp_path, monkeypatch):
+        """非法 asset_type 返回 400"""
+        client, _ = _client(monkeypatch, tmp_path)
+
+        with client:
+            resp = client.get("/api/v1/global-assets/invalid/abc.png")
+            assert resp.status_code == 400
+
+    def test_global_asset_missing_file_returns_404(self, tmp_path, monkeypatch):
+        """文件不存在时返回 404"""
+        client, _ = _client(monkeypatch, tmp_path)
+
+        with client:
+            resp = client.get("/api/v1/global-assets/character/nonexistent.png")
+            assert resp.status_code == 404
+
+    def test_global_asset_path_traversal_rejected(self, tmp_path, monkeypatch):
+        """filename 中包含 .. 应被阻止（400/403/404 均可接受）"""
+        client, _ = _client(monkeypatch, tmp_path)
+
+        with client:
+            # URL 编码的 ../evil.png
+            resp = client.get("/api/v1/global-assets/character/..%2Fevil.png")
+            assert resp.status_code in (400, 403, 404)
+
+    def test_global_asset_symlink_escape_returns_403(self, tmp_path, monkeypatch):
+        """在 _global_assets/character/ 里放一个指向外部文件的 symlink,应被 resolve-relative 检查拦截为 403。"""
+        import os
+        import sys
+
+        if sys.platform == "win32":
+            import pytest
+
+            pytest.skip("symlinks require admin on Windows")
+
+        client, pm = _client(monkeypatch, tmp_path)
+
+        # 在 tmp_path 下(但不在 _global_assets 里)创建一个外部目标文件
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"secret")
+
+        # 在 _global_assets/character/ 下建立指向外部目标的 symlink
+        global_dir = pm.get_global_assets_root() / "character"
+        global_dir.mkdir(parents=True, exist_ok=True)
+        link = global_dir / "evil.png"
+        os.symlink(outside, link)
+
+        with client:
+            r = client.get("/api/v1/global-assets/character/evil.png")
+            assert r.status_code == 403
+
+
+# ==================== Source 多格式上传 ====================
+
+import io  # noqa: E402
+
+
+def _upload_source(client, project_name: str, filename: str, content: bytes, on_conflict: str | None = None):
+    url = f"/api/v1/projects/{project_name}/upload/source"
+    if on_conflict:
+        url += f"?on_conflict={on_conflict}"
+    return client.post(
+        url,
+        files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+    )
+
+
+class TestSourceMultiFormatUpload:
+    def test_upload_source_utf8_txt_normalized(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            resp = _upload_source(client, "demo", "novel.txt", "纯 UTF-8".encode())
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["normalized"] is True
+            assert body["used_encoding"] == "utf-8"
+            assert body["original_kept"] is False
+            assert body["chapter_count"] == 0
+
+    def test_upload_source_gbk_txt_normalized_and_raw_kept(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            raw = ("第一章\n" * 30).encode("gbk")
+            resp = _upload_source(client, "demo", "old.txt", raw)
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["normalized"] is True
+            assert body["used_encoding"] and body["used_encoding"].lower() != "utf-8"
+            assert body["original_kept"] is True
+
+    def test_upload_source_doc_rejected_with_400(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            resp = _upload_source(client, "demo", "x.doc", b"binary")
+            assert resp.status_code == 400
+
+    def test_upload_source_conflict_returns_409_with_suggestion(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            _upload_source(client, "demo", "novel.txt", "首次".encode())
+            resp = _upload_source(client, "demo", "novel.txt", "再次".encode())
+            assert resp.status_code == 409
+            body = resp.json()
+            assert body["detail"]["existing"] == "novel.txt"
+            assert body["detail"]["suggested_name"] == "novel_1"
+
+    def test_upload_source_on_conflict_replace(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            _upload_source(client, "demo", "novel.txt", "旧内容".encode())
+            resp = _upload_source(client, "demo", "novel.txt", "新内容".encode(), on_conflict="replace")
+            assert resp.status_code == 200, resp.text
+            # 通过 GET 拉文本验证已替换
+            get_resp = client.get("/api/v1/projects/demo/source/novel.txt")
+            assert get_resp.status_code == 200
+            assert get_resp.text == "新内容"
+
+    def test_upload_source_on_conflict_rename(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            _upload_source(client, "demo", "novel.txt", "首次".encode())
+            resp = _upload_source(client, "demo", "novel.txt", "新版".encode(), on_conflict="rename")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["filename"] == "novel_1.txt"
+
+    def test_delete_source_cascades_raw(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            raw = ("第一章\n" * 30).encode("gbk")
+            _upload_source(client, "demo", "to_delete.txt", raw)
+            # 上传后应当存在 raw 备份
+            project_dir = pm.get_project_path("demo")
+            raw_path = project_dir / "source" / "raw" / "to_delete.txt"
+            assert raw_path.exists()
+
+            resp = client.delete("/api/v1/projects/demo/source/to_delete.txt")
+            assert resp.status_code == 200
+            assert not raw_path.exists()
+
+    def test_upload_source_invalid_on_conflict_returns_400_i18n(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            resp = client.post(
+                "/api/v1/projects/demo/upload/source?on_conflict=bogus",
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+            )
+            assert resp.status_code == 400
+            # Should not be the raw English phrase we replaced — check it's the translated form
+            assert resp.json()["detail"] != "on_conflict must be fail/replace/rename"
+
+    def test_upload_source_rejects_oversized_upload_by_content_length(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        from lib.source_loader import SourceLoader
+
+        # We don't actually send 50MB+ of data — instead post a small body with a fake
+        # content-length header. Starlette validates content-length vs actual body length
+        # for multipart, so we need to send a real oversized payload OR rely on the
+        # natural stat-based check. Skip the header fake and exercise the stat path:
+        body = b"a" * (SourceLoader.DEFAULT_MAX_BYTES + 1024)
+        with client:
+            resp = client.post(
+                "/api/v1/projects/demo/upload/source",
+                files={"file": ("big.txt", io.BytesIO(body), "text/plain")},
+            )
+            assert resp.status_code == 413
+
+    def test_list_files_source_includes_raw_filename(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            raw = ("第一章\n" * 30).encode("gbk")
+            _upload_source(client, "demo", "old.txt", raw)
+            resp = client.get("/api/v1/projects/demo/files")
+            body = resp.json()
+            source = body["files"]["source"]
+            entry = next(e for e in source if e["name"] == "old.txt")
+            assert entry["raw_filename"] == "old.txt"
+
+    def test_list_files_source_raw_filename_none_for_pure_utf8(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            _upload_source(client, "demo", "novel.txt", "纯 UTF-8".encode())
+            resp = client.get("/api/v1/projects/demo/files")
+            body = resp.json()
+            entry = next(e for e in body["files"]["source"] if e["name"] == "novel.txt")
+            assert entry["raw_filename"] is None

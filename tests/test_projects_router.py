@@ -74,7 +74,17 @@ class _FakePM:
     def generate_project_name(self, title):
         return self.generated_names.pop(0)
 
-    def create_project_metadata(self, name, title, style, content_mode, aspect_ratio="9:16", default_duration=None):
+    def create_project_metadata(
+        self,
+        name,
+        title,
+        style,
+        content_mode,
+        aspect_ratio="9:16",
+        default_duration=None,
+        style_template_id=None,
+        extras=None,
+    ):
         payload = {
             "title": (title or name),
             "style": style or "",
@@ -84,6 +94,10 @@ class _FakePM:
         }
         if default_duration is not None:
             payload["default_duration"] = default_duration
+        if style_template_id is not None:
+            payload["style_template_id"] = style_template_id
+        if extras:
+            payload.update(extras)
         self.project_data[name] = payload
         return payload
 
@@ -304,3 +318,309 @@ class TestProjectsRouter:
             assert "asset_fingerprints" in data
             assert "storyboards/scene_E1S01.png" in data["asset_fingerprints"]
             assert isinstance(data["asset_fingerprints"]["storyboards/scene_E1S01.png"], int)
+
+    def test_create_project_with_style_template_id_expands_prompt(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "模版项目",
+                    "name": "tpl-1",
+                    "style_template_id": "live_premium_drama",
+                    "content_mode": "drama",
+                    "aspect_ratio": "9:16",
+                },
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["tpl-1"]
+            assert data["style_template_id"] == "live_premium_drama"
+            assert "真人电视剧" in data["style"] or "精品短剧" in data["style"]
+
+    def test_create_project_with_unknown_template_id_returns_400(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "坏模版",
+                    "name": "bad-1",
+                    "style_template_id": "no_such",
+                },
+            )
+            assert resp.status_code == 400
+
+    def test_create_project_with_model_fields_persists(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "模型项目",
+                    "name": "m-1",
+                    "video_backend": "gemini-aistudio/veo-3",
+                    "image_backend": "gemini-aistudio/nano-banana",
+                    "text_backend_script": "gemini-aistudio/gemini-2.5",
+                    "default_duration": 8,
+                },
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["m-1"]
+            assert data["video_backend"] == "gemini-aistudio/veo-3"
+            assert data["image_backend"] == "gemini-aistudio/nano-banana"
+            assert data["text_backend_script"] == "gemini-aistudio/gemini-2.5"
+            assert data["default_duration"] == 8
+
+    def test_create_project_empty_model_fields_not_written(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "空字段项目",
+                    "name": "e-1",
+                    "video_backend": "",
+                    "image_backend": None,
+                },
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["e-1"]
+            assert "video_backend" not in data
+            assert "image_backend" not in data
+
+    def test_create_project_with_invalid_backend_returns_400(self, tmp_path, monkeypatch):
+        """非法 backend 字符串应被校验器拒绝。"""
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "Bad Backend",
+                    "name": "bad-bk",
+                    "video_backend": "garbage",  # 无 "/"，且不在 _LEGACY_PROVIDER_NAMES/PROVIDER_REGISTRY
+                },
+            )
+            assert resp.status_code == 400
+
+    def test_update_project_with_style_template_id_expands_and_clears_image(self, tmp_path, monkeypatch):
+        """PATCH style_template_id：写入 id + 展开 prompt 到 style，并清掉 style_image/description。"""
+        fake_pm = _FakePM(tmp_path)
+        # 预置一个带参考图的项目
+        fake_pm.project_data["ready"]["style_image"] = "style_reference.png"
+        fake_pm.project_data["ready"]["style_description"] = "old desc"
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"style_template_id": "live_zhang_yimou"},
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["ready"]
+            assert data["style_template_id"] == "live_zhang_yimou"
+            assert "张艺谋" in data["style"]
+            assert "style_image" not in data
+            assert "style_description" not in data
+
+    def test_update_project_with_unknown_template_id_returns_400(self, tmp_path, monkeypatch):
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"style_template_id": "no_such_template"},
+            )
+            assert resp.status_code == 400
+
+    def test_update_project_clear_style_template(self, tmp_path, monkeypatch):
+        """PATCH style_template_id=null：同时清掉 id 与派生的 style 长文本。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["style_template_id"] = "live_premium_drama"
+        fake_pm.project_data["ready"]["style"] = "画风：真人电视剧风格，精品短剧画风，大师级构图"
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"style_template_id": None},
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["ready"]
+            assert "style_template_id" not in data
+            assert data["style"] == ""
+
+    def test_update_project_clear_style_image(self, tmp_path, monkeypatch):
+        """PATCH clear_style_image=true：清掉 style_image 与 style_description。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["style_image"] = "style_reference.png"
+        fake_pm.project_data["ready"]["style_description"] = "some desc"
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"clear_style_image": True},
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["ready"]
+            assert "style_image" not in data
+            assert "style_description" not in data
+
+    def test_list_projects_returns_style_image_field(self, tmp_path, monkeypatch):
+        """列表端点需返回 style_image：否则前端无法区分"自定义风格"与"未设置"。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["style_image"] = "style_reference.png"
+        # 互斥：自定义图情况下 style_template_id 应为空
+        fake_pm.project_data["ready"].pop("style_template_id", None)
+        fake_pm.project_data["ready"]["style"] = ""
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.get("/api/v1/projects")
+            assert resp.status_code == 200
+            ready = [p for p in resp.json()["projects"] if p["name"] == "ready"][0]
+            assert ready["style_image"] == "style_reference.png"
+            assert ready.get("style_template_id") is None
+
+    def test_update_project_clear_style_combined(self, tmp_path, monkeypatch):
+        """一次性清空所有风格：style_template_id=null + clear_style_image=true。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["style_template_id"] = "live_premium_drama"
+        fake_pm.project_data["ready"]["style"] = "画风：..."
+        fake_pm.project_data["ready"]["style_image"] = "style_reference.png"
+        fake_pm.project_data["ready"]["style_description"] = "some desc"
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"style_template_id": None, "clear_style_image": True},
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["ready"]
+            assert "style_template_id" not in data
+            assert data["style"] == ""
+            assert "style_image" not in data
+            assert "style_description" not in data
+
+    # ---------------------------------------------------------------------------
+    # Episodes PATCH tests (Task 12 — reference-video mode)
+    # ---------------------------------------------------------------------------
+
+    def test_patch_project_episodes_updates_generation_mode(self, tmp_path, monkeypatch):
+        """PATCH /projects/{name} with episodes[] updates generation_mode for matched episode."""
+        fake_pm = _FakePM(tmp_path)
+        # 项目初始有 2 集，均无 generation_mode 字段
+        fake_pm.project_data["ready"]["episodes"] = [
+            {"episode": 1, "title": "第一集", "script_file": "scripts/ep1.json"},
+            {"episode": 2, "title": "第二集", "script_file": "scripts/ep2.json"},
+        ]
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"episodes": [{"episode": 1, "generation_mode": "reference_video"}]},
+            )
+            assert resp.status_code == 200
+            episodes = fake_pm.project_data["ready"]["episodes"]
+            ep1 = next(e for e in episodes if e["episode"] == 1)
+            ep2 = next(e for e in episodes if e["episode"] == 2)
+            assert ep1["generation_mode"] == "reference_video"
+            # 第二集不受影响
+            assert "generation_mode" not in ep2
+
+    def test_patch_project_episodes_strips_computed_fields(self, tmp_path, monkeypatch):
+        """PATCH 不得将 StatusCalculator 注入的计算字段写回 project.json。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["episodes"] = [
+            {"episode": 1, "title": "原标题", "script_file": "scripts/ep1.json"},
+        ]
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={
+                    "episodes": [
+                        {
+                            "episode": 1,
+                            "title": "新标题",
+                            # 以下为 StatusCalculator 注入的计算字段，不应写入磁盘
+                            "scenes_count": 999,
+                            "status": "completed",
+                            "storyboards": {"total": 5, "completed": 3},
+                            "videos": {"total": 5, "completed": 5},
+                            "script_status": "segmented",
+                            "duration_seconds": 120,
+                        }
+                    ]
+                },
+            )
+            assert resp.status_code == 200
+            ep1 = fake_pm.project_data["ready"]["episodes"][0]
+            # 合法字段应被写入
+            assert ep1["title"] == "新标题"
+            # 计算字段不得写入
+            assert "scenes_count" not in ep1
+            assert "status" not in ep1
+            assert "storyboards" not in ep1
+            assert "videos" not in ep1
+            assert "script_status" not in ep1
+            assert "duration_seconds" not in ep1
+
+    def test_patch_project_episodes_skips_unknown_episode(self, tmp_path, monkeypatch):
+        """PATCH 传入未知 episode 编号时，静默跳过，不改变已有 episodes。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["episodes"] = [
+            {"episode": 1, "title": "第一集", "script_file": "scripts/ep1.json"},
+            {"episode": 2, "title": "第二集", "script_file": "scripts/ep2.json"},
+        ]
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"episodes": [{"episode": 999, "generation_mode": "grid"}]},
+            )
+            assert resp.status_code == 200
+            episodes = fake_pm.project_data["ready"]["episodes"]
+            # 集数不变
+            assert len(episodes) == 2
+            # 已有字段不受影响
+            assert all("generation_mode" not in e for e in episodes)
+
+    def test_patch_project_episodes_clears_generation_mode_with_null(self, tmp_path, monkeypatch):
+        """PATCH 传入 generation_mode=null 时，清除集级覆盖以回退项目级继承。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.project_data["ready"]["episodes"] = [
+            {
+                "episode": 1,
+                "title": "第一集",
+                "script_file": "scripts/ep1.json",
+                "generation_mode": "reference_video",
+            },
+        ]
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"episodes": [{"episode": 1, "generation_mode": None}]},
+            )
+            assert resp.status_code == 200
+            ep1 = fake_pm.project_data["ready"]["episodes"][0]
+            # 显式 null 清除覆盖，回退项目级继承
+            assert "generation_mode" not in ep1
+            # 其他字段保持不变
+            assert ep1["title"] == "第一集"
+            assert ep1["script_file"] == "scripts/ep1.json"

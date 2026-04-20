@@ -57,12 +57,14 @@ describe("ProjectsPage", () => {
           name: "demo",
           title: "Demo Project",
           style: "Anime",
+          style_template_id: "anim_kyoto",
           thumbnail: null,
           status: {
             current_phase: "production",
             phase_progress: 0.5,
             characters: { total: 2, completed: 2 },
-            clues: { total: 2, completed: 1 },
+            scenes: { total: 1, completed: 1 },
+            props: { total: 1, completed: 0 },
             episodes_summary: { total: 1, scripted: 1, in_production: 1, completed: 0 },
           },
         },
@@ -72,8 +74,64 @@ describe("ProjectsPage", () => {
     renderPage();
 
     expect(await screen.findByText("Demo Project")).toBeInTheDocument();
-    expect(screen.getByText("Anime · 制作中")).toBeInTheDocument();
+    expect(screen.getByText("商业动画 京都 · 制作中")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
+  it("shows 自定义风格 label when project has style_image but no template_id", async () => {
+    vi.spyOn(API, "listProjects").mockResolvedValue({
+      projects: [
+        {
+          name: "demo",
+          title: "Custom Demo",
+          style: "",
+          style_template_id: null,
+          style_image: "style_reference.png",
+          thumbnail: null,
+          status: {
+            current_phase: "production",
+            phase_progress: 0.1,
+            characters: { total: 1, completed: 0 },
+            scenes: { total: 0, completed: 0 },
+            props: { total: 0, completed: 0 },
+            episodes_summary: { total: 1, scripted: 0, in_production: 1, completed: 0 },
+          },
+        },
+      ],
+    });
+
+    renderPage();
+
+    await screen.findByText("Custom Demo");
+    expect(screen.getByText(/自定义风格/)).toBeInTheDocument();
+  });
+
+  it("shows 未设置风格 label when project has neither template_id nor style_image", async () => {
+    vi.spyOn(API, "listProjects").mockResolvedValue({
+      projects: [
+        {
+          name: "demo",
+          title: "Empty Style Demo",
+          style: "",
+          style_template_id: null,
+          style_image: null,
+          thumbnail: null,
+          status: {
+            current_phase: "production",
+            phase_progress: 0,
+            characters: { total: 0, completed: 0 },
+            scenes: { total: 0, completed: 0 },
+            props: { total: 0, completed: 0 },
+            episodes_summary: { total: 0, scripted: 0, in_production: 0, completed: 0 },
+          },
+        },
+      ],
+    });
+
+    renderPage();
+
+    await screen.findByText("Empty Style Demo");
+    expect(screen.getByText(/未设置风格/)).toBeInTheDocument();
   });
 
   it("opens create project modal after clicking new project button", async () => {
@@ -104,7 +162,8 @@ describe("ProjectsPage", () => {
               current_phase: "completed",
               phase_progress: 1,
               characters: { total: 1, completed: 1 },
-              clues: { total: 1, completed: 1 },
+              scenes: { total: 1, completed: 1 },
+              props: { total: 0, completed: 0 },
               episodes_summary: { total: 1, scripted: 1, in_production: 0, completed: 1 },
             },
           },
@@ -119,7 +178,8 @@ describe("ProjectsPage", () => {
         style: "Anime",
         episodes: [],
         characters: {},
-        clues: {},
+        scenes: {},
+        props: {},
       },
       warnings: ["发现未识别的附加文件/目录: extras"],
       conflict_resolution: "none",
@@ -204,7 +264,8 @@ describe("ProjectsPage", () => {
               current_phase: "completed",
               phase_progress: 1,
               characters: { total: 1, completed: 1 },
-              clues: { total: 1, completed: 1 },
+              scenes: { total: 1, completed: 1 },
+              props: { total: 0, completed: 0 },
               episodes_summary: { total: 1, scripted: 1, in_production: 0, completed: 1 },
             },
           },
@@ -232,7 +293,8 @@ describe("ProjectsPage", () => {
           style: "Anime",
           episodes: [],
           characters: {},
-          clues: {},
+          scenes: {},
+          props: {},
         },
         warnings: [],
         conflict_resolution: "renamed",
