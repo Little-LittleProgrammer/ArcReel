@@ -16,6 +16,7 @@ PROVIDER_MAX_REFS: dict[str, int] = {
     "openai": 1,
     "grok": 7,
     "ark": 9,
+    "bailian": 5,
 }
 
 DEFAULT_MAX_REFS = 9
@@ -25,6 +26,7 @@ PROVIDER_MAX_DURATION: dict[str, int] = {
     "openai": 12,
     "grok": 15,
     "ark": 15,
+    "bailian": 15,
 }
 
 

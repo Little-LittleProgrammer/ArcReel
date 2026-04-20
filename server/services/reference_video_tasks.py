@@ -68,6 +68,7 @@ _PROVIDER_LIMITS: dict[tuple[str, str | None], dict[str, int]] = {
     ("openai", "sora"): {"max_refs": PROVIDER_MAX_REFS["openai"], "max_duration": PROVIDER_MAX_DURATION["openai"]},
     ("grok", None): {"max_refs": PROVIDER_MAX_REFS["grok"], "max_duration": PROVIDER_MAX_DURATION["grok"]},
     ("ark", None): {"max_refs": PROVIDER_MAX_REFS["ark"], "max_duration": PROVIDER_MAX_DURATION["ark"]},
+    ("bailian", "wan"): {"max_refs": PROVIDER_MAX_REFS["bailian"], "max_duration": PROVIDER_MAX_DURATION["bailian"]},
 }
 
 

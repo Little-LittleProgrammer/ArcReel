@@ -12,6 +12,7 @@ from lib.bailian_shared import BAILIAN_RETRYABLE_ERRORS, DEFAULT_DASHSCOPE_BASE_
 from lib.providers import PROVIDER_BAILIAN
 from lib.retry import DOWNLOAD_BACKOFF_SECONDS, DOWNLOAD_MAX_ATTEMPTS, with_retry_async
 from lib.video_backends.base import (
+    ReferenceMedia,
     VideoCapabilities,
     VideoCapability,
     VideoGenerationRequest,
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "wan2.7-t2v"
 _CREATE_TASK_URL = "/api/v1/services/aigc/video-generation/video-synthesis"
 _TASK_URL = "/api/v1/tasks/{task_id}"
-_SUPPORTED_MODELS = {"wan2.7-t2v", "wan2.7-i2v"}
+_SUPPORTED_MODELS = {"wan2.7-t2v", "wan2.7-i2v", "wan2.7-r2v"}
 _MODEL_CAPABILITIES: dict[str, set[VideoCapability]] = {
     "wan2.7-t2v": {VideoCapability.TEXT_TO_VIDEO, VideoCapability.GENERATE_AUDIO},
     "wan2.7-i2v": {VideoCapability.IMAGE_TO_VIDEO, VideoCapability.GENERATE_AUDIO},
@@ -41,8 +42,8 @@ _MODEL_CAPS: dict[str, VideoCapabilities] = {
 _MODEL_DURATION_RANGES: dict[str, range] = {
     "wan2.7-t2v": range(2, 16),
     "wan2.7-i2v": range(2, 16),
-    "wan2.7-r2v": range(2, 11),
-    "wan2.7-videoedit": range(2, 11),
+    "wan2.7-r2v": range(2, 16),
+    "wan2.7-videoedit": range(2, 16),
 }
 _MODEL_RESOLUTIONS: dict[str, set[str]] = {
     "wan2.7-t2v": {"480p", "720p", "1080p"},
@@ -122,7 +123,7 @@ class BailianVideoBackend:
 
     def _validate_request(self, request: VideoGenerationRequest) -> None:
         if self._model not in _SUPPORTED_MODELS:
-            raise ValueError(f"百炼视频模型 {self._model} 暂未实现，首版仅支持 wan2.7-t2v 和 wan2.7-i2v")
+            raise ValueError(f"百炼视频模型 {self._model} 暂未实现，当前仅支持 {', '.join(sorted(_SUPPORTED_MODELS))}")
 
         supported_durations = _MODEL_DURATION_RANGES.get(self._model, range(2, 16))
         if request.duration_seconds not in supported_durations:
@@ -141,6 +142,33 @@ class BailianVideoBackend:
             raise ValueError("wan2.7-i2v 需要提供首帧图像")
         if self._model != "wan2.7-i2v" and request.end_image is not None:
             raise ValueError(f"模型 {self._model} 不支持尾帧图像输入")
+
+        if self._model == "wan2.7-r2v":
+            # 兼容两种调用路径：reference_media（直接传入 ReferenceMedia 对象）
+            # 或 reference_images（从 execute_reference_video_task 经 MediaGenerator 传入的 Path 列表）
+            reference_media = request.reference_media or []
+            reference_images = request.reference_images or []
+            if not reference_media and not reference_images:
+                raise ValueError("wan2.7-r2v 需要提供至少一个参考素材")
+            # 统一按 Path 计数进行数量校验
+            total_refs = len(reference_media) if reference_media else len(reference_images)
+            if total_refs > 5:
+                raise ValueError("wan2.7-r2v 参考素材总数不得超过 5 个")
+
+            # reference_media 路径下进行类型细分校验
+            if reference_media:
+                video_count = sum(1 for item in reference_media if item.media_type == "video")
+                image_count = sum(1 for item in reference_media if item.media_type == "image")
+                invalid_types = sorted(
+                    {item.media_type for item in reference_media if item.media_type not in {"image", "video"}}
+                )
+
+                if invalid_types:
+                    raise ValueError(f"wan2.7-r2v 仅支持 image/video 参考素材，收到: {', '.join(invalid_types)}")
+                if video_count > 3:
+                    raise ValueError("wan2.7-r2v 参考视频数量不得超过 3 个")
+                if image_count > 9:
+                    raise ValueError("wan2.7-r2v 参考图片数量不得超过 9 个")
 
     @with_retry_async(max_attempts=3, backoff_seconds=(2, 4, 8), retryable_errors=BAILIAN_RETRYABLE_ERRORS)
     async def _create_task(self, request: VideoGenerationRequest) -> dict[str, str | None]:
@@ -178,6 +206,20 @@ class BailianVideoBackend:
             image_url = await self._resolve_media_url(Path(request.end_image), headers)
             media.append({"type": "last_frame", "url": image_url})
 
+        if self._model == "wan2.7-r2v":
+            refs = request.reference_media or []
+            if not refs:
+                # 兼容从 execute_reference_video_task 经 MediaGenerator 传入的 reference_images
+                refs = [ReferenceMedia(media_path=p, media_type="image") for p in (request.reference_images or [])]
+            for ref in refs:
+                media_url = await self._resolve_media_url(ref.media_path, headers)
+                media_type = "reference_image" if ref.media_type == "image" else "reference_video"
+                media_item: dict[str, str] = {"type": media_type, "url": media_url}
+                if ref.voice_path:
+                    voice_url = await self._resolve_media_url(ref.voice_path, headers)
+                    media_item["reference_voice"] = voice_url
+                media.append(media_item)
+
         if media:
             input_payload["media"] = media
 
@@ -195,7 +237,16 @@ class BailianVideoBackend:
 
     async def _resolve_media_url(self, path: Path, headers: dict[str, str]) -> str:
         raw = str(path)
-        if raw.startswith(("http://", "https://", "oss://")):
+        # Path 会规范化 URL，http:// 变成 http:/，需要特殊处理
+        if raw.startswith(("http:/", "https:/", "oss:/")):
+            # 恢复被 Path 规范化的 URL
+            if raw.startswith("http:/") and not raw.startswith("http://"):
+                raw = raw.replace("http:/", "http://", 1)
+            elif raw.startswith("https:/") and not raw.startswith("https://"):
+                raw = raw.replace("https:/", "https://", 1)
+            elif raw.startswith("oss:/") and not raw.startswith("oss://"):
+                raw = raw.replace("oss:/", "oss://", 1)
+
             if raw.startswith("oss://"):
                 headers["X-DashScope-OssResourceResolve"] = "enable"
             return raw
@@ -250,3 +301,5 @@ def _extract_video_url(result_data: dict[str, Any]) -> str:
                 return item["video"]
 
     raise RuntimeError("百炼视频任务结果中未找到视频 URL")
+
+

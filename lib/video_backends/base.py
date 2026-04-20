@@ -126,6 +126,15 @@ class VideoCapability(StrEnum):
 
 
 @dataclass
+class ReferenceMedia:
+    """R2V 参考素材（图片或视频，可选声音）。"""
+
+    media_path: Path
+    media_type: str  # "image" or "video"
+    voice_path: Path | None = None
+
+
+@dataclass
 class VideoGenerationRequest:
     """通用视频生成请求。各 Backend 忽略不支持的字段。"""
 
@@ -148,6 +157,9 @@ class VideoGenerationRequest:
     # Seedance 特有
     service_tier: str = "default"
     seed: int | None = None
+
+    # Bailian R2V 特有
+    reference_media: list[ReferenceMedia] | None = None
 
 
 @dataclass

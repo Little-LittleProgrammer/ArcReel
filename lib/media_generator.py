@@ -43,6 +43,7 @@ class MediaGenerator:
     OUTPUT_PATTERNS = {
         "storyboards": "storyboards/scene_{resource_id}.png",
         "videos": "videos/scene_{resource_id}.mp4",
+        "reference_videos": "reference_videos/{resource_id}.mp4",
         "characters": "characters/{resource_id}.png",
         "scenes": "scenes/{resource_id}.png",
         "props": "props/{resource_id}.png",
@@ -282,6 +283,7 @@ class MediaGenerator:
         start_image: str | Path | Image.Image | None = None,
         end_image: Path | None = None,
         reference_images: list[Path] | None = None,
+        reference_media: list | None = None,
         aspect_ratio: str = "9:16",
         duration_seconds: str = "8",
         resolution: str = "1080p",
@@ -298,6 +300,7 @@ class MediaGenerator:
             start_image: 起始帧图片（image-to-video 模式）
             end_image: 结束帧图片（first_last 模式）
             reference_images: 参考图片列表（multi-reference 模式）
+            reference_media: R2V 参考素材列表（ReferenceMedia 对象）
             aspect_ratio: 宽高比，默认 9:16（竖屏）
             duration_seconds: 视频时长，可选 "4", "6", "8"
             resolution: 分辨率，默认 "1080p"
@@ -315,6 +318,7 @@ class MediaGenerator:
                 start_image=start_image,
                 end_image=end_image,
                 reference_images=reference_images,
+                reference_media=reference_media,
                 aspect_ratio=aspect_ratio,
                 duration_seconds=duration_seconds,
                 resolution=resolution,
@@ -331,6 +335,7 @@ class MediaGenerator:
         start_image: str | Path | Image.Image | None = None,
         end_image: Path | None = None,
         reference_images: list[Path] | None = None,
+        reference_media: list | None = None,
         aspect_ratio: str = "9:16",
         duration_seconds: str = "8",
         resolution: str = "1080p",
@@ -347,6 +352,7 @@ class MediaGenerator:
             start_image: 起始帧图片（image-to-video 模式）
             end_image: 结束帧图片（first_last 模式）
             reference_images: 参考图片列表（multi-reference 模式）
+            reference_media: R2V 参考素材列表（ReferenceMedia 对象）
             aspect_ratio: 宽高比，默认 9:16（竖屏）
             duration_seconds: 视频时长，可选 "4", "6", "8"
             resolution: 分辨率，默认 "1080p"
@@ -401,7 +407,7 @@ class MediaGenerator:
         )
 
         try:
-            from lib.video_backends.base import VideoGenerationRequest
+            from lib.video_backends.base import ReferenceMedia, VideoGenerationRequest
 
             # Three-level fallback based on backend video capabilities
             actual_end_image = None
@@ -424,6 +430,16 @@ class MediaGenerator:
                         self._video_backend.name,
                     )
 
+            # Convert reference_images -> reference_media for R2V backends that require it.
+            actual_reference_media = reference_media
+            if not actual_reference_media and actual_reference_images:
+                caps = getattr(self._video_backend, "video_capabilities", None)
+                if caps and caps.reference_images:
+                    actual_reference_media = [
+                        ReferenceMedia(media_path=Path(p), media_type="image") for p in actual_reference_images
+                    ]
+                    actual_reference_images = None  # let R2V backend use reference_media exclusively
+
             request = VideoGenerationRequest(
                 prompt=prompt,
                 output_path=output_path,
@@ -433,6 +449,7 @@ class MediaGenerator:
                 start_image=Path(start_image) if isinstance(start_image, (str, Path)) else None,
                 end_image=actual_end_image,
                 reference_images=actual_reference_images,
+                reference_media=actual_reference_media,
                 generate_audio=effective_generate_audio,
                 negative_prompt=negative_prompt,
                 project_name=self.project_name,

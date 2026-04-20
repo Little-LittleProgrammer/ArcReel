@@ -29,12 +29,13 @@ class VersionManager:
     """版本管理器"""
 
     # 支持的资源类型
-    RESOURCE_TYPES = ("storyboards", "videos", "characters", "scenes", "props", "grids")
+    RESOURCE_TYPES = ("storyboards", "videos", "reference_videos", "characters", "scenes", "props", "grids")
 
     # 资源类型对应的文件扩展名
     EXTENSIONS = {
         "storyboards": ".png",
         "videos": ".mp4",
+        "reference_videos": ".mp4",
         "characters": ".png",
         "scenes": ".png",
         "props": ".png",
