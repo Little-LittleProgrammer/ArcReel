@@ -97,7 +97,7 @@ class BailianVideoBackend:
             is_done=lambda r: r.get("output", {}).get("task_status") == "SUCCEEDED",
             is_failed=_extract_error,
             poll_interval=5.0,
-            max_wait=900.0,
+            max_wait=2000.0,
             retryable_errors=BAILIAN_RETRYABLE_ERRORS,
             label="百炼视频",
             on_progress=lambda r, elapsed: logger.info(

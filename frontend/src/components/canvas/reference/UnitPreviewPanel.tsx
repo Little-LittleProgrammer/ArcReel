@@ -22,7 +22,7 @@ export function UnitPreviewPanel({ unit, projectName, onGenerate, generating }: 
     );
   }
 
-  const clip = unit.generated_assets.video_clip;
+  const clip = unit.generated_assets?.video_clip ?? null;
   const videoUrl = clip && projectName ? API.getFileUrl(projectName, clip) : null;
   const busy = generating;
 

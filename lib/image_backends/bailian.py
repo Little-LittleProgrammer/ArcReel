@@ -102,7 +102,7 @@ class BailianImageBackend:
             ),
             is_failed=lambda r: _extract_error(r),
             poll_interval=3.0,
-            max_wait=300.0,
+            max_wait=900.0,
             retryable_errors=BAILIAN_RETRYABLE_ERRORS,
             label="百炼图像",
         )

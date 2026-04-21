@@ -75,4 +75,11 @@ describe("UnitList", () => {
     fireEvent.click(screen.getByRole("button", { name: /New Unit|新建 Unit/ }));
     expect(onAdd).toHaveBeenCalled();
   });
+
+  it("does not throw when generated_assets is missing (legacy script)", () => {
+    const u = mkUnit("E1U1");
+    delete (u as Partial<ReferenceVideoUnit>).generated_assets;
+    render(<UnitList units={[u as ReferenceVideoUnit]} selectedId={null} onSelect={vi.fn()} onAdd={vi.fn()} />);
+    expect(screen.getByTestId("unit-row-E1U1")).toBeInTheDocument();
+  });
 });

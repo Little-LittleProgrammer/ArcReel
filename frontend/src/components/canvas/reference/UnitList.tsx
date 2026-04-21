@@ -56,7 +56,7 @@ export function UnitList({ units, selectedId, onSelect, onAdd }: UnitListProps) 
           className="flex-1 overflow-y-auto"
         >
           {units.map((u) => {
-            const status = u.generated_assets.status;
+            const status: UnitPersistedStatus = u.generated_assets?.status ?? "pending";
             const selected = u.unit_id === selectedId;
             return (
               <li
