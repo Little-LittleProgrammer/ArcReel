@@ -53,7 +53,7 @@ export function UnitList({ units, selectedId, onSelect, onAdd }: UnitListProps) 
         <ul
           role="listbox"
           aria-label={t("reference_unit_list_title")}
-          className="flex-1 overflow-y-auto"
+          className="flex-1 min-h-0 overflow-y-auto custom-scrollbar max-h-[500px]"
         >
           {units.map((u) => {
             const status: UnitPersistedStatus = u.generated_assets?.status ?? "pending";
