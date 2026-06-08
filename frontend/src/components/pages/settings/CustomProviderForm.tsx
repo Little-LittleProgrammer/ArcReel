@@ -1,45 +1,66 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import { Loader2, Plus, Trash2, Eye, EyeOff, CheckCircle2, XCircle, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
+import { useEndpointCatalogStore } from "@/stores/endpoint-catalog-store";
 import { uid } from "@/utils/id";
+import { errMsg } from "@/utils/async";
 import type {
   CustomProviderInfo,
   CustomProviderModelInput,
   DiscoveredModel,
+  EndpointKey,
 } from "@/types";
+import { priceLabel, urlPreviewFor, toggleDefaultReducer, type DiscoveryFormat } from "./customProviderHelpers";
+import { EndpointSelect } from "./EndpointSelect";
+import { ResolutionPicker } from "@/components/shared/ResolutionPicker";
+import { IMAGE_STANDARD_RESOLUTIONS, VIDEO_STANDARD_RESOLUTIONS } from "@/utils/provider-models";
+import {
+  compactRangeFormat,
+  parseDurationInput,
+  DurationParseError,
+  type DurationParseErrorCode,
+} from "@/utils/duration_format";
+
+import {
+  ACCENT_BTN_CLS,
+  ACCENT_BUTTON_STYLE,
+  CARD_STYLE,
+  GHOST_BTN_CLS,
+  INPUT_CLS,
+} from "@/components/ui/darkroom-tokens";
+import { FieldLabel } from "@/components/ui/FieldLabel";
 
 // ---------------------------------------------------------------------------
-// Types
+// Style constants
 // ---------------------------------------------------------------------------
 
-type ApiFormat = "openai" | "google" | "newapi";
-type MediaType = "text" | "image" | "video";
+const COMPACT_INPUT_CLS =
+  "min-w-0 rounded-[6px] border border-hairline bg-bg-grad-a/55 px-2 py-1 text-[12.5px] text-text placeholder:text-text-4 transition-colors hover:border-hairline-strong focus:border-accent/55 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
 
-const API_FORMAT_OPTIONS: { value: ApiFormat; label: string }[] = [
-  { value: "openai", label: "OpenAI" },
-  { value: "google", label: "Google" },
-  { value: "newapi", label: "NewAPI" },
-];
+// ---------------------------------------------------------------------------
+// Types & constants
+// ---------------------------------------------------------------------------
 
-const MEDIA_TYPE_OPTIONS: { value: MediaType; label: string }[] = [
-  { value: "text", label: "media_type_text" },
-  { value: "image", label: "media_type_image" },
-  { value: "video", label: "media_type_video" },
+const DISCOVERY_FORMAT_OPTIONS: { value: DiscoveryFormat; labelKey: string }[] = [
+  { value: "openai", labelKey: "discovery_format_openai" },
+  { value: "google", labelKey: "discovery_format_google" },
 ];
 
 interface ModelRow {
   key: string; // unique key for React
   model_id: string;
   display_name: string;
-  media_type: MediaType;
+  endpoint: EndpointKey;
   is_default: boolean;
   is_enabled: boolean;
   price_unit: string;
   price_input: string;
   price_output: string;
   currency: string;
+  resolution: string; // 空串 = null
+  supported_durations_text: string; // 用户原始文本，提交前 parse；空串 = 让后端按 preset 兜底
 }
 
 function newModelRow(partial?: Partial<ModelRow>): ModelRow {
@@ -47,13 +68,15 @@ function newModelRow(partial?: Partial<ModelRow>): ModelRow {
     key: uid(),
     model_id: "",
     display_name: "",
-    media_type: "text",
+    endpoint: "openai-chat",
     is_default: false,
     is_enabled: true,
     price_unit: "",
     price_input: "",
     price_output: "",
     currency: "USD",
+    resolution: "",
+    supported_durations_text: "",
     ...partial,
   };
 }
@@ -62,7 +85,7 @@ function discoveredToRow(m: DiscoveredModel): ModelRow {
   return newModelRow({
     model_id: m.model_id,
     display_name: m.display_name,
-    media_type: m.media_type,
+    endpoint: m.endpoint,
     is_default: m.is_default,
     is_enabled: m.is_enabled,
   });
@@ -72,38 +95,104 @@ function existingToRow(m: CustomProviderInfo["models"][number]): ModelRow {
   return newModelRow({
     model_id: m.model_id,
     display_name: m.display_name,
-    media_type: m.media_type,
+    endpoint: m.endpoint,
     is_default: m.is_default,
     is_enabled: m.is_enabled,
     price_unit: m.price_unit ?? "",
     price_input: m.price_input != null ? String(m.price_input) : "",
     price_output: m.price_output != null ? String(m.price_output) : "",
     currency: m.currency ?? "",
+    resolution: m.resolution ?? "",
+    supported_durations_text: m.supported_durations ? compactRangeFormat(m.supported_durations) : "",
   });
 }
 
 function rowToInput(r: ModelRow): CustomProviderModelInput {
+  const trimmed = r.supported_durations_text.trim();
+  // 失败时直接抛 DurationParseError；handleSave 在调用前应已通过 validateModelDurations 拦截，
+  // 故此处只负责诚实地把字符串转成 list[int] 而不静默降级（避免无效输入被改成 null
+  // 后被后端 preset 自动推断覆盖，造成静默数据偏移）
+  const supported_durations = trimmed ? parseDurationInput(trimmed) : null;
   return {
     model_id: r.model_id,
     display_name: r.display_name || r.model_id,
-    media_type: r.media_type,
+    endpoint: r.endpoint,
     is_default: r.is_default,
     is_enabled: r.is_enabled,
     ...(r.price_unit ? { price_unit: r.price_unit } : {}),
     ...(r.price_input ? { price_input: parseFloat(r.price_input) } : {}),
     ...(r.price_output ? { price_output: parseFloat(r.price_output) } : {}),
     ...(r.currency ? { currency: r.currency } : {}),
+    ...(r.resolution ? { resolution: r.resolution } : { resolution: null }),
+    ...(supported_durations ? { supported_durations } : { supported_durations: null }),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Price label helper
+// DurationsInputRow — 视频模型行内的 supported_durations 输入
 // ---------------------------------------------------------------------------
 
-function priceLabel(mediaType: MediaType, t: (key: string) => string): { input: string; output: string } {
-  if (mediaType === "video") return { input: t("price_per_second"), output: "" };
-  if (mediaType === "image") return { input: t("price_per_image"), output: "" };
-  return { input: t("price_per_m_input"), output: t("price_per_m_output") };
+const DURATION_ERROR_KEY: Record<DurationParseErrorCode, string> = {
+  empty_after_split: "supported_durations_err_empty_after_split",
+  non_positive: "supported_durations_err_non_positive",
+  exceeds_max: "supported_durations_err_exceeds_max",
+  range_too_large: "supported_durations_err_range_too_large",
+  range_inverted: "supported_durations_err_range_inverted",
+  unparseable: "supported_durations_err_unparseable",
+};
+
+function DurationsInputRow({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const { t } = useTranslation("dashboard");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const handleChange = (next: string) => {
+    onChange(next);
+    if (!next.trim()) {
+      setErrorMsg(null);
+      return;
+    }
+    try {
+      parseDurationInput(next);
+      setErrorMsg(null);
+    } catch (e) {
+      if (e instanceof DurationParseError) {
+        setErrorMsg(t(DURATION_ERROR_KEY[e.code], e.params));
+      } else {
+        setErrorMsg(t(DURATION_ERROR_KEY.unparseable, { seg: "" }));
+      }
+    }
+  };
+
+  return (
+    <div className="mt-2 flex flex-col gap-1 pl-6">
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-3 whitespace-nowrap">
+          {t("supported_durations_label")}
+        </span>
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => handleChange(e.target.value)}
+          placeholder={t("supported_durations_placeholder")}
+          aria-label={t("supported_durations_label")}
+          className={`${COMPACT_INPUT_CLS} flex-1`}
+        />
+      </div>
+      {errorMsg ? (
+        <p className="text-[11px] text-warm-bright">
+          {t("supported_durations_invalid", { message: errorMsg })}
+        </p>
+      ) : (
+        <p className="text-[11px] text-text-4">{t("supported_durations_help")}</p>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -120,9 +209,17 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
   const { t } = useTranslation("dashboard");
   const isEdit = !!existing;
 
+  // Endpoint catalog（后端单一真相源）：mediaType 推断、price/default 互斥分组都从这里读。
+  const endpointToMediaType = useEndpointCatalogStore((s) => s.endpointToMediaType);
+  const endpointToImageCapabilities = useEndpointCatalogStore((s) => s.endpointToImageCapabilities);
+  const fetchEndpointCatalog = useEndpointCatalogStore((s) => s.fetch);
+  useEffect(() => {
+    void fetchEndpointCatalog();
+  }, [fetchEndpointCatalog]);
+
   // --- Form state ---
   const [displayName, setDisplayName] = useState(existing?.display_name ?? "");
-  const [apiFormat, setApiFormat] = useState<ApiFormat>(existing?.api_format ?? "openai");
+  const [discoveryFormat, setDiscoveryFormat] = useState<DiscoveryFormat>(existing?.discovery_format ?? "openai");
   const [baseUrl, setBaseUrl] = useState(existing?.base_url ?? "");
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
@@ -144,19 +241,33 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
     return models.filter((m) => m.model_id.toLowerCase().includes(q));
   }, [models, modelFilter]);
 
+  const allFilteredEnabled = useMemo(
+    () => filteredModels.length > 0 && filteredModels.every((m) => m.is_enabled),
+    [filteredModels],
+  );
+
+  // base_url 相对存储值是否变更：变更后必须用 UI 上的新地址 + 新 key 走明文路径，
+  // 否则 by-id 端点会用 DB 中的旧 base_url，与保存的新地址错位。
+  const baseUrlChanged = !!existing && baseUrl.trim() !== existing.base_url.trim();
+  // 编辑模式下若用户未输入新 key 且 base_url 未变更，则用已存储凭证（by-id 端点）；
+  // 创建模式或 base_url 变更时必须明文 api_key。发现模型与测试连接共用此判断。
+  const useStoredCredential = !!existing && !apiKey && !baseUrlChanged;
+
   // --- Discover models ---
   const handleDiscover = useCallback(async () => {
     if (!baseUrl) {
       showError(t("fill_base_url_first"));
       return;
     }
-    if (!apiKey) {
-      showError(t("fill_api_key_first"));
+    if (!useStoredCredential && !apiKey) {
+      showError(t(baseUrlChanged ? "base_url_changed_reenter_key" : "fill_api_key_first"));
       return;
     }
     setDiscovering(true);
     try {
-      const res = await API.discoverModels({ api_format: apiFormat, base_url: baseUrl, api_key: apiKey });
+      const res = useStoredCredential
+        ? await API.discoverModelsForProvider(existing.id)
+        : await API.discoverModels({ discovery_format: discoveryFormat, base_url: baseUrl, api_key: apiKey });
       const discovered = res.models.map(discoveredToRow);
       setModels((prev) => {
         const existingIds = new Map(prev.map((r) => [r.model_id, r]));
@@ -178,29 +289,36 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
       });
       setModelFilter("");
     } catch (e) {
-      showError(e instanceof Error ? e.message : t("fetch_models_failed"));
+      showError(errMsg(e, t("fetch_models_failed")));
     } finally {
       setDiscovering(false);
     }
-  }, [apiFormat, baseUrl, apiKey, showError, t]);
+  }, [discoveryFormat, baseUrl, apiKey, useStoredCredential, baseUrlChanged, existing, showError, t]);
 
   // --- Test connection ---
   const handleTest = useCallback(async () => {
+    // 清空上一次结果放在所有校验之前：校验失败直接 return 时也不残留旧的成功/失败提示。
+    setTestResult(null);
     if (!baseUrl) {
       showError(t("fill_base_url_first"));
       return;
     }
+    if (!useStoredCredential && !apiKey) {
+      showError(t(baseUrlChanged ? "base_url_changed_reenter_key" : "fill_api_key_first"));
+      return;
+    }
     setTesting(true);
-    setTestResult(null);
     try {
-      const res = await API.testCustomConnection({ api_format: apiFormat, base_url: baseUrl, api_key: apiKey });
+      const res = useStoredCredential
+        ? await API.testCustomConnectionById(existing.id)
+        : await API.testCustomConnection({ discovery_format: discoveryFormat, base_url: baseUrl, api_key: apiKey });
       setTestResult(res);
     } catch (e) {
-      setTestResult({ success: false, message: e instanceof Error ? e.message : t("connection_test_failed") });
+      setTestResult({ success: false, message: errMsg(e, t("connection_test_failed")) });
     } finally {
       setTesting(false);
     }
-  }, [apiFormat, baseUrl, apiKey, showError, t]);
+  }, [discoveryFormat, baseUrl, apiKey, useStoredCredential, baseUrlChanged, existing, showError, t]);
 
   // --- Save ---
   const handleSave = useCallback(async () => {
@@ -227,6 +345,20 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
       showError(t("enabled_model_needs_id"));
       return;
     }
+    // 在拼装 payload 前显式校验所有行的 supported_durations 格式：失败则阻断保存，
+    // 让用户回去修正标红字段；不再让 rowToInput 静默把非法降级为 null
+    let payloadModels: CustomProviderModelInput[];
+    try {
+      payloadModels = models.map(rowToInput);
+    } catch (e) {
+      if (e instanceof DurationParseError) {
+        const msg = t(DURATION_ERROR_KEY[e.code], e.params);
+        showError(t("supported_durations_invalid", { message: msg }));
+      } else {
+        showError(t("save_failed", { message: errMsg(e) }));
+      }
+      return;
+    }
     setSaving(true);
     try {
       if (isEdit && existing) {
@@ -235,34 +367,28 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
           display_name: displayName,
           base_url: baseUrl,
           ...(apiKey ? { api_key: apiKey } : {}),
-          models: models.map(rowToInput),
+          models: payloadModels,
         });
       } else {
         await API.createCustomProvider({
           display_name: displayName,
-          api_format: apiFormat,
+          discovery_format: discoveryFormat,
           base_url: baseUrl,
           api_key: apiKey,
-          models: models.map(rowToInput),
+          models: payloadModels,
         });
       }
       onSaved();
     } catch (e) {
-      showError(e instanceof Error ? e.message : t("save_failed"));
+      showError(t("save_failed", { message: errMsg(e) }));
     } finally {
       setSaving(false);
     }
-  }, [displayName, apiFormat, baseUrl, apiKey, models, isEdit, existing, onSaved, showError, t]);
+  }, [displayName, discoveryFormat, baseUrl, apiKey, models, isEdit, existing, onSaved, showError, t]);
 
   // --- Model row helpers ---
   const updateModel = (key: string, patch: Partial<ModelRow>) => {
-    setModels((prev) =>
-      prev.map((m) => {
-        if (m.key !== key) return m;
-        const updated = { ...m, ...patch };
-        return updated;
-      }),
-    );
+    setModels((prev) => prev.map((m) => (m.key === key ? { ...m, ...patch } : m)));
   };
 
   const removeModel = (key: string) => {
@@ -273,105 +399,74 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
     setModels((prev) => [...prev, newModelRow()]);
   };
 
-  const toggleDefault = (key: string, mediaType: MediaType) => {
-    setModels((prev) =>
-      prev.map((m) => {
-        if (m.media_type !== mediaType) return m;
-        return { ...m, is_default: m.key === key ? !m.is_default : false };
-      }),
-    );
-  };
-
-  // --- Shared input classes ---
-  const inputCls =
-    "w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:border-indigo-500 focus-ring";
-  const selectCls =
-    "rounded-lg border border-gray-700 bg-gray-900 px-2 py-1.5 text-sm text-gray-100 focus:border-indigo-500 focus-ring";
-
   // --- Base URL preview (effective models endpoint) ---
-  const urlPreview = (() => {
-    const trimmed = baseUrl.trim().replace(/\/+$/, "");
-    if (!trimmed) return null;
-    if (apiFormat === "openai") {
-      // OpenAI SDK 需要 /v1 后缀，后端自动补全
-      const base = trimmed.match(/\/v\d+$/) ? trimmed : `${trimmed}/v1`;
-      return `${base}/models`;
-    }
-    // Google SDK 自动拼接 /v1beta，后端会剥离用户误填的版本路径
-    const base = trimmed.replace(/\/v\d+\w*$/, "");
-    return `${base}/v1beta/models`;
-  })();
+  const urlPreview = urlPreviewFor(discoveryFormat, baseUrl);
 
   return (
-    <div className="flex h-full flex-col">
-      {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto p-6">
+    <div>
+      {/* Form content */}
+      <div className="p-6 pb-24">
       <div className="max-w-2xl">
-      <h3 className="mb-6 text-lg font-semibold text-gray-100">
-        {isEdit ? t("edit_custom_provider") : t("add_custom_provider_title")}
-      </h3>
+      <div className="mb-6">
+        <div className="font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-accent-2">
+          {isEdit ? "EDIT PROVIDER" : "NEW PROVIDER"}
+        </div>
+        <h3
+          className="font-editorial mt-1"
+          style={{
+            fontWeight: 400,
+            fontSize: 22,
+            lineHeight: 1.1,
+            letterSpacing: "-0.012em",
+            color: "var(--color-text)",
+          }}
+        >
+          {isEdit ? t("edit_custom_provider") : t("add_custom_provider_title")}
+        </h3>
+      </div>
 
       <div className="space-y-4">
         {/* Display name */}
         <div>
-          <label htmlFor="cp-name" className="mb-1.5 block text-sm text-gray-400">
-            {t("cp_name_label")} <span className="text-red-400">*</span>
-          </label>
+          <FieldLabel htmlFor="cp-name" required>
+            {t("cp_name_label")}
+          </FieldLabel>
           <input
             id="cp-name"
             type="text"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder={t("cp_name_placeholder")}
-            className={inputCls}
+            className={INPUT_CLS}
           />
-        </div>
-
-        {/* API Format */}
-        <div>
-          <label htmlFor="cp-format" className="mb-1.5 block text-sm text-gray-400">
-            {t("api_format_label")}
-          </label>
-          <select
-            id="cp-format"
-            value={apiFormat}
-            onChange={(e) => setApiFormat(e.target.value as ApiFormat)}
-            disabled={isEdit}
-            className={selectCls}
-          >
-            {API_FORMAT_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
         </div>
 
         {/* Base URL */}
         <div>
-          <label htmlFor="cp-url" className="mb-1.5 block text-sm text-gray-400">
-            {t("base_url")} <span className="text-red-400">*</span>
-          </label>
+          <FieldLabel htmlFor="cp-url" required>
+            {t("base_url")}
+          </FieldLabel>
           <input
             id="cp-url"
             type="url"
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://api.example.com/v1"
-            className={inputCls}
+            placeholder="https://api.example.com"
+            className={INPUT_CLS}
           />
           {urlPreview && (
-            <div className="mt-1 truncate text-xs text-gray-500">
-              {t("preview_url")}{urlPreview}
+            <div className="mt-1.5 truncate font-mono text-[10.5px] text-text-4">
+              {t("preview_url")}
+              {urlPreview}
             </div>
           )}
         </div>
 
         {/* API Key */}
         <div>
-          <label htmlFor="cp-key" className="mb-1.5 block text-sm text-gray-400">
-            {t("api_key_label")} {!isEdit && <span className="text-red-400">*</span>}
-          </label>
+          <FieldLabel htmlFor="cp-key" required={!isEdit}>
+            {t("api_key_label")}
+          </FieldLabel>
           <div className="relative">
             <input
               id="cp-key"
@@ -380,17 +475,39 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={isEdit ? existing?.api_key_masked ?? t("keep_existing_key_hint") : t("enter_api_key_placeholder")}
-              className={`${inputCls} pr-9`}
+              className={`${INPUT_CLS} pr-10`}
             />
             <button
               type="button"
               onClick={() => setShowApiKey((v) => !v)}
-              className="absolute right-2 top-1/2 -translate-y-1/2 rounded text-gray-500 hover:text-gray-300 focus-ring"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded text-text-4 transition-colors hover:text-text-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               aria-label={showApiKey ? t("common:hide") : t("common:show")}
             >
-              {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             </button>
           </div>
+        </div>
+
+        {/* Discovery format (de-emphasized) */}
+        <div className="flex flex-wrap items-center gap-2">
+          <label
+            htmlFor="cp-discovery"
+            className="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4"
+          >
+            {t("discovery_format_label")}
+          </label>
+          <select
+            id="cp-discovery"
+            value={discoveryFormat}
+            onChange={(e) => setDiscoveryFormat(e.target.value as DiscoveryFormat)}
+            disabled={isEdit}
+            className="rounded-[6px] border border-hairline bg-bg-grad-a/55 px-2 py-1 text-[11.5px] text-text-2 hover:border-hairline-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+          >
+            {DISCOVERY_FORMAT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{t(o.labelKey)}</option>
+            ))}
+          </select>
+          <span className="font-mono text-[10.5px] text-text-4">{t("discovery_format_help")}</span>
         </div>
 
         {/* Discover button */}
@@ -399,11 +516,11 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
             type="button"
             onClick={() => void handleDiscover()}
             disabled={discovering}
-            className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:text-gray-100 disabled:opacity-50"
+            className={GHOST_BTN_CLS}
           >
             {discovering ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" />
                 {t("discovering_models")}
               </>
             ) : (
@@ -415,43 +532,46 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
         {/* Model list */}
         {models.length > 0 && (
           <div>
-            <div className="mb-2 flex items-center gap-3 text-sm text-gray-400">
-              <span>{t("model_list")}</span>
+            <div className="mb-2 flex items-center gap-3">
+              <span className="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+                {t("model_list")}
+              </span>
               {models.length > 1 && (
                 <button
                   type="button"
                   onClick={() => {
                     const targetKeys = new Set(filteredModels.map((m) => m.key));
-                    const allEnabled = filteredModels.every((m) => m.is_enabled);
                     setModels((prev) =>
-                      prev.map((m) => (targetKeys.has(m.key) ? { ...m, is_enabled: !allEnabled } : m)),
+                      prev.map((m) => (targetKeys.has(m.key) ? { ...m, is_enabled: !allFilteredEnabled } : m)),
                     );
                   }}
-                  className="text-xs text-indigo-400 hover:text-indigo-300"
+                  className="font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-text-3 transition-colors hover:text-accent-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 >
-                  {filteredModels.every((m) => m.is_enabled) ? t("deselect_all") : t("select_all")}
+                  {allFilteredEnabled ? t("deselect_all") : t("select_all")}
                 </button>
               )}
             </div>
             {models.length > 5 && (
               <div className="relative mb-2">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-text-4" />
                 <input
                   type="text"
                   value={modelFilter}
                   onChange={(e) => setModelFilter(e.target.value)}
                   placeholder={t("search_models")}
-                  className="w-full rounded-lg border border-gray-700 bg-gray-900 py-1.5 pl-8 pr-3 text-xs text-gray-100 placeholder-gray-600 focus:border-indigo-500 focus-ring"
+                  className={`${INPUT_CLS} py-1.5 pl-8 pr-3 text-[12px]`}
                 />
               </div>
             )}
             <div className="space-y-2">
               {filteredModels.map((m) => {
-                const pl = priceLabel(m.media_type, t);
+                const pl = priceLabel(m.endpoint, endpointToMediaType, t);
+                const media = endpointToMediaType[m.endpoint];
                 return (
                   <div
                     key={m.key}
-                    className="rounded-xl border border-gray-800 bg-gray-950/40 p-3"
+                    className="rounded-[10px] border border-hairline p-3"
+                    style={CARD_STYLE}
                   >
                     <div className="flex flex-wrap items-center gap-2">
                       {/* Enable toggle */}
@@ -460,7 +580,7 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                           type="checkbox"
                           checked={m.is_enabled}
                           onChange={(e) => updateModel(m.key, { is_enabled: e.target.checked })}
-                          className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-800 text-indigo-500 focus:ring-indigo-500"
+                          className="h-3.5 w-3.5 cursor-pointer rounded border-hairline bg-bg-grad-a accent-[var(--color-accent)]"
                           aria-label={t("enable_model")}
                         />
                       </label>
@@ -472,32 +592,39 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                         onChange={(e) => updateModel(m.key, { model_id: e.target.value })}
                         placeholder="model-id…"
                         aria-label={t("model_id_label")}
-                        className="min-w-0 flex-1 rounded-lg border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-gray-100 placeholder-gray-600 focus-visible:border-indigo-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+                        className={`${COMPACT_INPUT_CLS} flex-1`}
                       />
 
-                      {/* Media type */}
-                      <select
-                        value={m.media_type}
-                        onChange={(e) => updateModel(m.key, { media_type: e.target.value as MediaType })}
-                        aria-label={t("media_type_label")}
-                        className={selectCls}
-                      >
-                        {MEDIA_TYPE_OPTIONS.map((o) => (
-                          <option key={o.value} value={o.value}>
-                            {t(o.label)}
-                          </option>
-                        ))}
-                      </select>
+                      {/* Endpoint select (custom dropdown showing real API path) */}
+                      <EndpointSelect
+                        value={m.endpoint}
+                        onChange={(next) => updateModel(m.key, { endpoint: next, is_default: false })}
+                        ariaLabel={t("endpoint_label")}
+                      />
 
                       {/* Default toggle */}
                       <button
                         type="button"
-                        onClick={() => toggleDefault(m.key, m.media_type)}
-                        className={`rounded-lg px-2 py-1 text-xs transition-colors ${
+                        onClick={() =>
+                          setModels((prev) =>
+                            toggleDefaultReducer(prev, m.key, endpointToMediaType, endpointToImageCapabilities),
+                          )
+                        }
+                        className="rounded-[6px] px-2 py-1 font-mono text-[10px] font-bold uppercase tracking-[0.14em] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        style={
                           m.is_default
-                            ? "bg-indigo-600 text-white"
-                            : "border border-gray-700 text-gray-500 hover:border-gray-600 hover:text-gray-300"
-                        }`}
+                            ? {
+                                background: "var(--color-accent-dim)",
+                                color: "var(--color-accent-2)",
+                                border: "1px solid var(--color-accent-soft)",
+                                boxShadow: "0 0 12px -6px var(--color-accent-glow)",
+                              }
+                            : {
+                                background: "var(--color-bg-grad-a)",
+                                color: "var(--color-text-3)",
+                                border: "1px solid var(--color-hairline)",
+                              }
+                        }
                       >
                         {t("default_label")}
                       </button>
@@ -506,7 +633,7 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                       <button
                         type="button"
                         onClick={() => removeModel(m.key)}
-                        className="rounded p-1 text-gray-500 hover:text-red-400"
+                        className="rounded p-1 text-text-4 transition-colors hover:text-warm-bright focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         aria-label={t("delete_model")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -514,12 +641,12 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                     </div>
 
                     {/* Pricing row */}
-                    <div className="mt-2 flex flex-wrap items-center gap-2 pl-6 text-xs text-gray-500">
+                    <div className="mt-2 flex flex-wrap items-center gap-2 pl-6 text-[11px] text-text-4">
                       <select
                         value={m.currency}
                         onChange={(e) => updateModel(m.key, { currency: e.target.value })}
                         aria-label={t("currency_label")}
-                        className="rounded border border-gray-700 bg-gray-900 px-1 py-0.5 text-xs text-gray-300 focus-visible:border-indigo-500 focus-visible:outline-none"
+                        className="rounded-[5px] border border-hairline bg-bg-grad-a/55 px-1 py-0.5 text-[11px] text-text-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                       >
                         <option value="USD">$</option>
                         <option value="CNY">&yen;</option>
@@ -531,12 +658,12 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                         onChange={(e) => updateModel(m.key, { price_input: e.target.value })}
                         placeholder="0.00"
                         aria-label={t("input_price")}
-                        className="w-16 rounded border border-gray-700 bg-gray-900 px-1.5 py-0.5 text-xs text-gray-300 placeholder-gray-600 focus-visible:border-indigo-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+                        className={`${COMPACT_INPUT_CLS} w-16`}
                       />
                       <span>{pl.input}</span>
                       {pl.output && (
                         <>
-                          <span className="text-gray-600">|</span>
+                          <span className="text-text-4">|</span>
                           <input
                             type="text"
                             inputMode="decimal"
@@ -544,12 +671,37 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
                             onChange={(e) => updateModel(m.key, { price_output: e.target.value })}
                             placeholder="0.00"
                             aria-label={t("output_price")}
-                            className="w-16 rounded border border-gray-700 bg-gray-900 px-1.5 py-0.5 text-xs text-gray-300 placeholder-gray-600 focus-visible:border-indigo-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+                            className={`${COMPACT_INPUT_CLS} w-16`}
                           />
                           <span>{pl.output}</span>
                         </>
                       )}
                     </div>
+
+                    {/* Resolution row */}
+                    {media !== "text" && (
+                      <div className="mt-2 flex items-center gap-2 pl-6">
+                        <span className="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-3 whitespace-nowrap">
+                          {t("resolution_label")}
+                        </span>
+                        <ResolutionPicker
+                          mode="combobox"
+                          options={media === "image" ? IMAGE_STANDARD_RESOLUTIONS : VIDEO_STANDARD_RESOLUTIONS}
+                          value={m.resolution || null}
+                          onChange={(v) => updateModel(m.key, { resolution: v ?? "" })}
+                          placeholder={t("resolution_default_placeholder")}
+                          aria-label={t("resolution_label")}
+                        />
+                      </div>
+                    )}
+
+                    {/* Supported durations row（仅 video endpoint） */}
+                    {media === "video" && (
+                      <DurationsInputRow
+                        value={m.supported_durations_text}
+                        onChange={(v) => updateModel(m.key, { supported_durations_text: v })}
+                      />
+                    )}
                   </div>
                 );
               })}
@@ -559,7 +711,7 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
             <button
               type="button"
               onClick={addManualModel}
-              className="mt-2 flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300"
+              className="mt-2 flex items-center gap-1.5 font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-text-3 transition-colors hover:text-accent-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               <Plus className="h-3.5 w-3.5" />
               {t("add_model_manually")}
@@ -569,12 +721,12 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
 
         {/* Empty model hint */}
         {models.length === 0 && (
-          <div className="rounded-xl border border-dashed border-gray-700 p-4 text-center text-sm text-gray-500">
+          <div className="rounded-[10px] border border-dashed border-hairline-strong bg-bg-grad-a/45 p-4 text-center text-[12.5px] text-text-3">
             {t("discover_or_add_hint")}
             <button
               type="button"
               onClick={addManualModel}
-              className="ml-1 text-indigo-400 hover:text-indigo-300"
+              className="ml-1 font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] text-accent-2 transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               {t("add_model_manually")}
             </button>
@@ -585,16 +737,25 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
         {testResult && (
           <div
             aria-live="polite"
-            className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${
+            className="flex items-start gap-2 rounded-[8px] px-3 py-2 text-[12.5px]"
+            style={
               testResult.success
-                ? "border-green-800/50 bg-green-900/20 text-green-400"
-                : "border-red-800/50 bg-red-900/20 text-red-400"
-            }`}
+                ? {
+                    background: "oklch(0.30 0.10 155 / 0.15)",
+                    color: "var(--color-good)",
+                    border: "1px solid oklch(0.45 0.10 155 / 0.30)",
+                  }
+                : {
+                    background: "var(--color-warm-tint)",
+                    color: "var(--color-warm-bright)",
+                    border: "1px solid var(--color-warm-ring)",
+                  }
+            }
           >
             {testResult.success ? (
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             ) : (
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             )}
             <span>{testResult.message}</span>
           </div>
@@ -602,20 +763,27 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
 
       </div>
       </div>{/* end max-w-2xl */}
-      </div>{/* end scrollable content */}
+      </div>{/* end form content */}
 
-      {/* Fixed actions bar — outside scroll area */}
-      <div className="shrink-0 border-t border-gray-800 bg-gray-950 px-6 py-3">
+      {/* Sticky actions bar */}
+      <div
+        className="sticky bottom-0 z-10 border-t border-hairline px-6 py-3 backdrop-blur"
+        style={{
+          background:
+            "linear-gradient(180deg, oklch(0.20 0.011 265 / 0.65), oklch(0.15 0.010 265 / 0.85))",
+        }}
+      >
         <div className="flex items-center gap-3">
           <button
             type="button"
             onClick={() => void handleSave()}
             disabled={saving}
-            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-1.5 text-sm text-white transition-colors hover:bg-indigo-500 disabled:opacity-50"
+            className={ACCENT_BTN_CLS}
+            style={ACCENT_BUTTON_STYLE}
           >
             {saving ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" />
                 {t("common:saving")}
               </>
             ) : (
@@ -627,11 +795,11 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
             type="button"
             onClick={() => void handleTest()}
             disabled={testing}
-            className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:text-gray-100 disabled:opacity-50"
+            className={GHOST_BTN_CLS}
           >
             {testing ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" />
                 {t("testing_connection")}
               </>
             ) : (
@@ -642,7 +810,7 @@ export function CustomProviderForm({ existing, onSaved, onCancel }: CustomProvid
           <button
             type="button"
             onClick={onCancel}
-            className="rounded-lg px-3 py-1.5 text-sm text-gray-400 transition-colors hover:text-gray-200"
+            className="rounded-[8px] px-3 py-1.5 text-[12.5px] text-text-3 transition-colors hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             {t("common:cancel")}
           </button>

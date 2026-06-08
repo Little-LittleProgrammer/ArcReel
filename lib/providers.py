@@ -4,10 +4,13 @@ from typing import Literal
 
 PROVIDER_GEMINI = "gemini"
 PROVIDER_ARK = "ark"
+PROVIDER_ARK_AGENT_PLAN = "ark-agent-plan"
 PROVIDER_GROK = "grok"
 PROVIDER_OPENAI = "openai"
+PROVIDER_VIDU = "vidu"
 PROVIDER_NEWAPI = "newapi"
-PROVIDER_BAILIAN = "bailian"
+PROVIDER_DASHSCOPE = "dashscope"
+PROVIDER_ANTHROPIC = "anthropic"
 
 CallType = Literal["image", "video", "text"]
 CALL_TYPE_IMAGE: CallType = "image"

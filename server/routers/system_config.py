@@ -9,19 +9,23 @@ is managed by the providers router.
 from __future__ import annotations
 
 import logging
+import tomllib
+from datetime import UTC, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 from fastapi import APIRouter, Depends, HTTPException
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.repository import mask_secret
-from lib.config.service import (
-    ConfigService,
-    sync_anthropic_env,
-)
+from lib.config.resolver import ConfigResolver
+from lib.config.service import ConfigService
 from lib.db import get_async_session
+from lib.httpx_shared import get_http_client
 from lib.i18n import Translator
 from server.auth import CurrentUser
 from server.dependencies import get_config_service
@@ -30,6 +34,16 @@ from server.routers._validators import validate_backend_value
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PYPROJECT_PATH = _PROJECT_ROOT / "pyproject.toml"
+_GITHUB_RELEASE_LATEST_URL = "https://api.github.com/repos/ArcReel/ArcReel/releases/latest"
+_GITHUB_USER_AGENT = "ArcReel"
+_VERSION_CACHE_TTL_SECONDS = 300
+_latest_release_cache: dict[str, datetime | dict[str, str] | None] = {
+    "expires_at": None,
+    "payload": None,
+    "fetched_at": None,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,6 +55,73 @@ class _OptionsDict(TypedDict):
     image_backends: list[str]
     text_backends: list[str]
     provider_names: dict[str, str]
+
+
+@lru_cache(maxsize=1)
+def _read_app_version() -> str:
+    with _PYPROJECT_PATH.open("rb") as f:
+        data = tomllib.load(f)
+
+    version = str(data["project"]["version"]).strip()
+    if not version:
+        raise RuntimeError("project.version is empty")
+    return version
+
+
+def _parse_version(raw: str) -> Version | None:
+    text = raw.strip().removeprefix("v")
+    if not text:
+        return None
+    try:
+        return Version(text)
+    except InvalidVersion:
+        return None
+
+
+def _build_latest_release_payload(data: dict[str, Any]) -> dict[str, str]:
+    raw_version = str(data.get("name") or data.get("tag_name") or "").strip()
+    return {
+        "version": raw_version.removeprefix("v"),
+        "tag_name": str(data.get("tag_name") or ""),
+        "name": str(data.get("name") or ""),
+        "body": str(data.get("body") or ""),
+        "html_url": str(data.get("html_url") or ""),
+        "published_at": str(data.get("published_at") or ""),
+    }
+
+
+async def _get_latest_release() -> tuple[dict[str, str], datetime]:
+    """Fetch latest GitHub release with a 5-minute cache.
+
+    Returns (payload, fetched_at) where fetched_at is the timestamp of the
+    actual successful HTTP fetch (not the current request time). This makes
+    the value safe to surface as `checked_at` to clients without misleading
+    them about cache freshness.
+    """
+    now = datetime.now(UTC)
+    expires_at = _latest_release_cache.get("expires_at")
+    payload = _latest_release_cache.get("payload")
+    fetched_at = _latest_release_cache.get("fetched_at")
+    if (
+        isinstance(expires_at, datetime)
+        and expires_at > now
+        and isinstance(payload, dict)
+        and isinstance(fetched_at, datetime)
+    ):
+        return payload, fetched_at
+
+    response = await get_http_client().get(
+        _GITHUB_RELEASE_LATEST_URL,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": _GITHUB_USER_AGENT},
+        timeout=5.0,
+    )
+    response.raise_for_status()
+    payload = _build_latest_release_payload(response.json())
+
+    _latest_release_cache["payload"] = payload
+    _latest_release_cache["fetched_at"] = now
+    _latest_release_cache["expires_at"] = now + timedelta(seconds=_VERSION_CACHE_TTL_SECONDS)
+    return payload, now
 
 
 async def _build_options(svc: ConfigService, session: AsyncSession) -> _OptionsDict:
@@ -65,6 +146,7 @@ async def _build_options(svc: ConfigService, session: AsyncSession) -> _OptionsD
                 buckets[bucket].append(f"{provider_id}/{model_id}")
 
     from lib.custom_provider import make_provider_id
+    from lib.custom_provider.endpoints import endpoint_to_media_type
     from lib.db.repositories.custom_provider_repo import CustomProviderRepository
 
     try:
@@ -74,7 +156,8 @@ async def _build_options(svc: ConfigService, session: AsyncSession) -> _OptionsD
         enabled_models = await repo.list_all_enabled_models()
         for model in enabled_models:
             pid = make_provider_id(model.provider_id)
-            bucket = _MEDIA_TO_BUCKET.get(model.media_type)
+            media_type = endpoint_to_media_type(model.endpoint)
+            bucket = _MEDIA_TO_BUCKET.get(media_type)
             if bucket:
                 buckets[bucket].append(f"{pid}/{model.model_id}")
             if pid not in provider_names and model.provider_id in provider_name_map:
@@ -82,7 +165,7 @@ async def _build_options(svc: ConfigService, session: AsyncSession) -> _OptionsD
     except Exception:
         pass  # Non-fatal: custom providers unavailable shouldn't break the options endpoint
 
-    return {**buckets, "provider_names": provider_names}
+    return {**buckets, "provider_names": provider_names}  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +176,8 @@ async def _build_options(svc: ConfigService, session: AsyncSession) -> _OptionsD
 class SystemConfigPatchRequest(BaseModel):
     default_video_backend: str | None = None
     default_image_backend: str | None = None
+    default_image_backend_t2i: str | None = None
+    default_image_backend_i2i: str | None = None
     default_text_backend: str | None = None
     video_generate_audio: bool | None = None
     anthropic_api_key: str | None = None
@@ -110,6 +195,11 @@ class SystemConfigPatchRequest(BaseModel):
 
 
 # Setting keys that map directly to string DB settings
+#
+# DEPRECATED: anthropic_api_key / anthropic_base_url 已迁移至 agent_anthropic_credentials 表
+# (spec 2026-05-11-agent-url-config-optimization)。这里保留 anthropic_base_url 读写仅作旧客户端
+# 兼容；新 UI 走 /api/v1/agent/credentials/* 接口。计划在 0.14.0 删除 anthropic_api_key /
+# anthropic_base_url 字段，anthropic_*_model 系列保留（仍由 Section 2 Model Routing 管理）。
 _STRING_SETTINGS = (
     "anthropic_base_url",
     "anthropic_model",
@@ -136,13 +226,27 @@ async def get_system_config(
 ) -> dict[str, Any]:
     # Read all settings in a single query
     all_s = await svc.get_all_settings()
-    video_generate_audio_raw = all_s.get("video_generate_audio", "false")
-    video_generate_audio = video_generate_audio_raw.lower() in ("true", "1", "yes")
+    video_generate_audio_raw = all_s.get("video_generate_audio", "")
+    video_generate_audio = (
+        video_generate_audio_raw.lower() in ("true", "1", "yes")
+        if video_generate_audio_raw
+        else ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO
+    )
     anthropic_key = all_s.get("anthropic_api_key", "")
+    # 兼容新凭证目录：旧 system_settings 没填但 agent_anthropic_credentials 有 active 时
+    # 也算 is_set，避免 dashboard "未配置" 红点误报
+    if not anthropic_key:
+        from lib.db.repositories.agent_credential_repo import AgentCredentialRepository
+
+        active_cred = await AgentCredentialRepository(session).get_active()
+        if active_cred is not None:
+            anthropic_key = active_cred.api_key
 
     settings: dict[str, Any] = {
         "default_video_backend": all_s.get("default_video_backend", ""),
         "default_image_backend": all_s.get("default_image_backend", ""),
+        "default_image_backend_t2i": all_s.get("default_image_backend_t2i", ""),
+        "default_image_backend_i2i": all_s.get("default_image_backend_i2i", ""),
         "default_text_backend": all_s.get("default_text_backend", ""),
         "video_generate_audio": video_generate_audio,
         "anthropic_api_key": {
@@ -167,6 +271,40 @@ async def get_system_config(
     return {"settings": settings, "options": options}
 
 
+@router.get("/system/version")
+async def get_system_version(
+    _user: CurrentUser,
+    _t: Translator,
+) -> dict[str, Any]:
+    try:
+        current_version = _read_app_version()
+    except Exception as exc:
+        logger.exception("Failed to read app version")
+        raise HTTPException(status_code=500, detail=_t("about_version_read_failed")) from exc
+
+    latest: dict[str, str] | None = None
+    has_update = False
+    update_check_error: str | None = None
+    checked_at: datetime = datetime.now(UTC)
+    try:
+        latest, checked_at = await _get_latest_release()
+        latest_v = _parse_version(latest["version"])
+        current_v = _parse_version(current_version)
+        if latest_v is not None and current_v is not None:
+            has_update = latest_v > current_v
+    except Exception as exc:
+        logger.warning("Failed to fetch latest release: %s", exc)
+        update_check_error = _t("about_update_check_failed")
+
+    return {
+        "current": {"version": current_version},
+        "latest": latest,
+        "has_update": has_update,
+        "checked_at": checked_at.isoformat(),
+        "update_check_error": update_check_error,
+    }
+
+
 # ---------------------------------------------------------------------------
 # PATCH /system/config
 # ---------------------------------------------------------------------------
@@ -185,7 +323,13 @@ async def patch_system_config(
         patch[field_name] = getattr(req, field_name)
 
     # Validate backend references (empty string = auto-resolve)
-    for backend_key in ("default_video_backend", "default_image_backend", "default_text_backend"):
+    for backend_key in (
+        "default_video_backend",
+        "default_image_backend",
+        "default_image_backend_t2i",
+        "default_image_backend_i2i",
+        "default_text_backend",
+    ):
         if backend_key in patch:
             value = str(patch[backend_key] or "").strip()
             if value:
@@ -227,9 +371,5 @@ async def patch_system_config(
 
     await session.commit()
 
-    # Sync Anthropic settings to env vars so Claude Agent SDK picks them up
-    all_settings = await svc.get_all_settings()
-    sync_anthropic_env(all_settings)
-
     # Return updated config
-    return await get_system_config(_user=_user, svc=svc)
+    return await get_system_config(_user=_user, svc=svc, session=session)

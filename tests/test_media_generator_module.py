@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from lib.image_backends.base import ImageCapability, ImageGenerationResult
 from lib.media_generator import MediaGenerator
 
 
@@ -10,7 +11,7 @@ class _FakeImageBackend:
 
     name = "fake-image"
     model = "img-model"
-    capabilities = set()
+    capabilities = {ImageCapability.TEXT_TO_IMAGE, ImageCapability.IMAGE_TO_IMAGE}
 
     def __init__(self):
         self.calls = []
@@ -20,6 +21,12 @@ class _FakeImageBackend:
         # Touch the output file so version tracking works
         request.output_path.parent.mkdir(parents=True, exist_ok=True)
         request.output_path.write_bytes(b"fake-image-data")
+        return ImageGenerationResult(
+            image_path=request.output_path,
+            provider=self.name,
+            model=self.model,
+            usage_tokens=8,
+        )
 
 
 class _FakeVideoResult:
@@ -108,6 +115,7 @@ class TestMediaGenerator:
         assert gen._get_output_path("storyboards", "E1S01").name == "scene_E1S01.png"
         assert gen._get_output_path("videos", "E1S01").name == "scene_E1S01.mp4"
         assert gen._get_output_path("characters", "Alice").name == "Alice.png"
+        assert gen._get_output_path("reference_videos", "E1U1").name == "E1U1.mp4"
         with pytest.raises(ValueError):
             gen._get_output_path("bad", "x")
 
@@ -124,6 +132,7 @@ class TestMediaGenerator:
         assert version == 1
         assert gen.usage_tracker.started[0]["call_type"] == "image"
         assert gen.usage_tracker.finished[0]["status"] == "success"
+        assert gen.usage_tracker.finished[0]["usage_tokens"] == 8
 
         async def _raise(request):
             raise RuntimeError("boom")
@@ -183,5 +192,19 @@ class TestMediaGenerator:
             prompt="p",
             resource_type="videos",
             resource_id="E1S04",
+        )
+        assert gen.usage_tracker.started[-1]["generate_audio"] is True
+
+    @pytest.mark.asyncio
+    async def test_video_generate_audio_defaults_true_when_config_none(self, tmp_path):
+        """当 self._config is None 时，fallback 默认 True，
+        与 ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO 对齐（PR7 §11）。"""
+        gen = _build_generator(tmp_path)
+        gen._config = None
+
+        await gen.generate_video_async(
+            prompt="p",
+            resource_type="videos",
+            resource_id="E1S05",
         )
         assert gen.usage_tracker.started[-1]["generate_audio"] is True

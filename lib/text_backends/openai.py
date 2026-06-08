@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from openai import AsyncOpenAI, BadRequestError
 
+from lib.logging_utils import format_kwargs_for_log
 from lib.openai_shared import OPENAI_RETRYABLE_ERRORS, create_openai_client
 from lib.providers import PROVIDER_OPENAI
 from lib.retry import with_retry_async
@@ -31,10 +33,14 @@ class OpenAITextBackend:
         api_key: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
+        provider_name: str = PROVIDER_OPENAI,
     ):
         # 禁用 SDK 内置重试，由本层 generate() 统一管理重试策略
         self._client = create_openai_client(api_key=api_key, base_url=base_url, max_retries=0)
         self._model = model or DEFAULT_MODEL
+        # 复用 OpenAI 兼容协议的 provider（如 dashscope）须用真实 provider 记账，
+        # 否则计费查表会命中 OpenAI 的 USD 费率而非自身定价。
+        self._provider_name = provider_name
         self._capabilities: set[TextCapability] = {
             TextCapability.TEXT_GENERATION,
             TextCapability.STRUCTURED_OUTPUT,
@@ -43,7 +49,7 @@ class OpenAITextBackend:
 
     @property
     def name(self) -> str:
-        return PROVIDER_OPENAI
+        return self._provider_name
 
     @property
     def model(self) -> str:
@@ -80,13 +86,7 @@ class OpenAITextBackend:
                 },
             }
 
-        logger.info(
-            "OpenAITextBackend 请求参数 provider=%s model=%s kwargs=%r",
-            PROVIDER_OPENAI,
-            self._model,
-            kwargs,
-        )
-
+        logger.info("调用 %s 文本 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
         try:
             response = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
@@ -95,21 +95,33 @@ class OpenAITextBackend:
                     "原生 response_format 失败 (%s)，降级到 Instructor 路径",
                     exc,
                 )
-                return await _instructor_fallback(self._client, self._model, request, messages)
+                return await _instructor_fallback(
+                    self._client, self._model, request, messages, provider=self._provider_name
+                )
             raise
 
         usage = response.usage
         choice = response.choices[0]
         output_tokens = usage.completion_tokens if usage else None
+        text = choice.message.content or ""
+
+        if request.response_schema and not _is_valid_json(text):
+            logger.warning(
+                "原生 response_format 返回非 JSON 内容（代理可能未支持 response_format），降级到 Instructor 路径",
+            )
+            return await _instructor_fallback(
+                self._client, self._model, request, messages, provider=self._provider_name
+            )
+
         warn_if_truncated(
             getattr(choice, "finish_reason", None),
-            provider=PROVIDER_OPENAI,
+            provider=self._provider_name,
             model=self._model,
             output_tokens=output_tokens,
         )
         return TextGenerationResult(
-            text=choice.message.content or "",
-            provider=PROVIDER_OPENAI,
+            text=text,
+            provider=self._provider_name,
             model=self._model,
             input_tokens=usage.prompt_tokens if usage else None,
             output_tokens=output_tokens,
@@ -151,6 +163,21 @@ _SCHEMA_ERROR_KEYWORDS = (
 )
 
 
+def _is_valid_json(text: str) -> bool:
+    """判断字符串是否为合法 JSON。
+
+    一些 OpenAI 兼容代理（自定义供应商常见情况）会静默忽略 response_format
+    参数并返回纯文本/markdown，需要据此触发 Instructor 降级。
+    """
+    if not text or not text.strip():
+        return False
+    try:
+        json.loads(text)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _is_schema_error(exc: BaseException) -> bool:
     """判断异常是否为 JSON Schema 不兼容导致的错误。
 
@@ -170,6 +197,8 @@ async def _instructor_fallback(
     model: str,
     request: TextGenerationRequest,
     messages: list[dict],
+    *,
+    provider: str = PROVIDER_OPENAI,
 ) -> TextGenerationResult:
     """Instructor 降级：当原生 response_format 不可用时的备选路径。"""
     from lib.text_backends.instructor_support import instructor_fallback_async
@@ -179,6 +208,6 @@ async def _instructor_fallback(
         model=model,
         messages=messages,
         response_schema=request.response_schema,
-        provider=PROVIDER_OPENAI,
+        provider=provider,
         max_tokens=request.max_output_tokens,
     )

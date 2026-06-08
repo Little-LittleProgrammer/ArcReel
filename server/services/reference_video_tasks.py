@@ -12,12 +12,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from lib.asset_types import BUCKET_KEY, SHEET_KEY
+from lib.config.resolver import ConfigResolver
+from lib.db import async_session_factory
 from lib.db.base import DEFAULT_USER_ID
 from lib.image_utils import compress_image_bytes
-from lib.reference_video import render_prompt_for_backend
+from lib.prompt_builders import append_video_negative_tail
+from lib.reference_video import assemble_shots_text, render_prompt_for_backend
 from lib.reference_video.errors import MissingReferenceError, RequestPayloadTooLargeError
-from lib.reference_video.limits import PROVIDER_MAX_DURATION, PROVIDER_MAX_REFS
 from lib.script_models import ReferenceResource
 from lib.thumbnail import extract_video_thumbnail
 from server.services.generation_tasks import get_media_generator, get_project_manager
@@ -35,7 +39,7 @@ def _resolve_unit_references(
     Raises:
         MissingReferenceError: 任一 reference 在 project.json 对应 bucket 缺失或 sheet 不存在。
     """
-    missing: list[tuple[str, str]] = []
+    missing: list[tuple[str, str | None]] = []
     resolved: list[Path] = []
     for ref in references:
         rtype = ref.get("type")
@@ -58,30 +62,6 @@ def _resolve_unit_references(
     if missing:
         raise MissingReferenceError(missing=missing)
     return resolved
-
-
-# 供应商能力上限（数值来源：lib/reference_video/limits.py 单一真相源）。
-# 这里保留 (provider, model_prefix) 粒度是因为同一 provider 不同模型上限一致，
-# 单键即可命中；若未来出现 provider 内差异，再扩展 model_prefix。
-_PROVIDER_LIMITS: dict[tuple[str, str | None], dict[str, int]] = {
-    ("gemini", "veo"): {"max_refs": PROVIDER_MAX_REFS["gemini"], "max_duration": PROVIDER_MAX_DURATION["gemini"]},
-    ("openai", "sora"): {"max_refs": PROVIDER_MAX_REFS["openai"], "max_duration": PROVIDER_MAX_DURATION["openai"]},
-    ("grok", None): {"max_refs": PROVIDER_MAX_REFS["grok"], "max_duration": PROVIDER_MAX_DURATION["grok"]},
-    ("ark", None): {"max_refs": PROVIDER_MAX_REFS["ark"], "max_duration": PROVIDER_MAX_DURATION["ark"]},
-    ("bailian", "wan"): {"max_refs": PROVIDER_MAX_REFS["bailian"], "max_duration": PROVIDER_MAX_DURATION["bailian"]},
-}
-
-
-def _lookup_provider_limits(provider: str, model: str | None) -> dict[str, int]:
-    """查找供应商 / 模型对应的参考图 + duration 上限。找不到返回空 dict（不裁剪）。"""
-    provider = (provider or "").lower()
-    model = (model or "").lower()
-    for (p, prefix), limits in _PROVIDER_LIMITS.items():
-        if p != provider:
-            continue
-        if prefix is None or model.startswith(prefix):
-            return limits
-    return {}
 
 
 def _compress_references_to_tempfiles(
@@ -120,26 +100,39 @@ def _compress_references_to_tempfiles(
 
 
 def _render_unit_prompt(unit: dict) -> str:
-    """拼接 unit.shots[*].text 为单一 prompt，再用 shot_parser 把 @X 替成 [图N]。"""
-    shots = unit.get("shots") or []
-    raw = "\n".join(str(s.get("text", "")) for s in shots)
+    """从 unit.shots[*].text 拼接 prompt，用 shot_parser 把 @X 替成 [图N]，再追加反向尾词。
+
+    空提示词的*结构校验*已上移到入队守卫点（``TaskSpec.from_request``），两条入队路径
+    （WebUI / SDK）在入队时即拒绝空提示词。此处保留一道防御性空检查，因为参考生视频的
+    提示词源是*可变*的 script 文件且执行期从新读取（队列 dedup 不看 payload，无法靠入队
+    快照兜底）：若提示词在入队后被改空、或在途遗留任务漏过守卫，这道检查避免空提示词被
+    尾词追加成非空文本绕过 backend 的空值保护、白白消耗付费配额。
+    """
+    raw = assemble_shots_text(unit.get("shots") or [])
     references = [ReferenceResource(type=r["type"], name=r["name"]) for r in (unit.get("references") or [])]
-    return render_prompt_for_backend(raw, references)
+    rendered = render_prompt_for_backend(raw, references)
+    if not rendered.strip():
+        raise ValueError("reference video unit prompt is empty: all shots[*].text are blank")
+    return append_video_negative_tail(rendered)
 
 
 def _apply_provider_constraints(
     *,
     provider: str,
     model: str | None,
+    max_refs: int | None,
+    max_duration: int | None,
     references: list[Path],
     duration_seconds: int,
 ) -> tuple[list[Path], int, list[dict]]:
-    """按供应商上限裁剪 references / duration；回传 warnings（i18n key + 参数）。"""
+    """按供应商上限裁剪 references / duration；回传 warnings（i18n key + 参数）。
+
+    `max_refs` / `max_duration` 由调用方从 `ConfigResolver.video_capabilities_for_project`
+    取得（model 粒度，单一真相源）；任意一项为 None 表示不做对应裁剪。
+    """
     warnings: list[dict] = []
-    limits = _lookup_provider_limits(provider, model)
 
     new_duration = duration_seconds
-    max_duration = limits.get("max_duration")
     if max_duration is not None and duration_seconds > max_duration:
         new_duration = max_duration
         warnings.append(
@@ -154,7 +147,6 @@ def _apply_provider_constraints(
         )
 
     new_refs = list(references)
-    max_refs = limits.get("max_refs")
     if max_refs is not None and len(references) > max_refs:
         new_refs = references[:max_refs]
         # Sora 单图走专门的 warning key，其他走通用
@@ -181,6 +173,7 @@ async def execute_reference_video_task(
     payload: dict[str, Any],
     *,
     user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """处理一个 reference_video unit 的生成。
 
@@ -213,19 +206,70 @@ async def execute_reference_video_task(
     provider_name = getattr(backend, "name", "") if backend else ""
     model_name = getattr(backend, "model", "") if backend else ""
 
-    # 4. Provider 特判：裁 refs + duration
+    # 4. 解析 model 粒度能力上限（单一真相源：model.supported_durations）。
+    #    失败时 fallback 到 None（不裁剪，交由 backend 自行报错），与
+    #    ScriptGenerator._fetch_video_capabilities 的口径保持一致。
+    #
+    #    注意：caps 基于 `project.json.video_backend` 解析；但自定义 provider 的 model
+    #    被禁用时，`_create_custom_backend` 会静默回退到默认启用 model（见
+    #    server/services/generation_tasks.py:99-122）。为避免"按旧模型 clamp、按新模型生成"
+    #    的错位，下面校验 caps.model 与 backend.model 是否一致；不一致就 skip clamp，
+    #    把决策推给 backend 自报错。根治需要 `VideoCapabilities` 协议暴露 `max_duration`，
+    #    本 PR 范围内先缓解。
+    max_refs: int | None = None
+    max_duration: int | None = None
+    try:
+        resolver = ConfigResolver(async_session_factory)
+        caps = await resolver.video_capabilities_for_project(project)
+        caps_model = caps.get("model")
+        if model_name and caps_model and caps_model != model_name:
+            logger.warning(
+                "project.json video_backend model (%s) 与实际 backend model (%s) 不一致，"
+                "跳过 executor clamp 以避免按错误模型裁剪（常见于自定义模型禁用回退）。",
+                caps_model,
+                model_name,
+            )
+        else:
+            max_refs = caps.get("max_reference_images")
+            max_duration = caps.get("max_duration")
+    except (ValueError, SQLAlchemyError) as exc:
+        logger.info("无法解析 video_capabilities，跳过 executor clamp：%s", exc)
+
+    # 5. Provider 特判：裁 refs + duration
     base_duration = int(unit.get("duration_seconds") or 8)
     constrained_refs, effective_duration, warnings = _apply_provider_constraints(
         provider=provider_name,
         model=model_name,
+        max_refs=max_refs,
+        max_duration=max_duration,
         references=source_refs,
         duration_seconds=base_duration,
     )
 
-    # 5. 渲染 prompt（@→[图N]）
-    rendered_prompt = _render_unit_prompt(unit)
+    # resolver key 必须是 registry provider_id（project.video_backend 的 "/" 前半段），
+    # 而非 backend.name（如 "gemini"）——与 generation_tasks.execute_video_task 保持一致。
+    from server.services.resolution_resolver import get_provider_fallback, resolve_resolution
 
-    # 6. 压缩到临时文件（2048px/q=85）→ 首次调用
+    video_backend_raw = project.get("video_backend") or ""
+    registry_provider_id = video_backend_raw.split("/", 1)[0] if "/" in video_backend_raw else provider_name
+
+    resolution = await resolve_resolution(project, registry_provider_id or provider_name, model_name or "")
+    if resolution is None:
+        resolution = get_provider_fallback(provider_name)
+
+    # 6. 渲染 prompt（@→[图N]）。必须按 `constrained_refs` 的长度裁 `unit.references`
+    #    再渲染，保证 [图N] 的 1-based 索引与 backend 实际收到的 reference_images
+    #    长度严格对齐；否则裁剪后的 `@clipped_name` 会被替成 `[图N]` 指向不存在的图。
+    #    prompt 始终从执行期新读取的 unit.shots 重组（脚本可变 + 队列 dedup 不看 payload，
+    #    用入队快照会丢失入队后对镜头文本的编辑）；入队 payload 里的 prompt 仅作守卫点的
+    #    校验记录，执行期不使用。
+    unit_for_prompt = unit
+    unit_refs = unit.get("references") or []
+    if len(constrained_refs) < len(unit_refs):
+        unit_for_prompt = {**unit, "references": unit_refs[: len(constrained_refs)]}
+    rendered_prompt = _render_unit_prompt(unit_for_prompt)
+
+    # 7. 压缩到临时文件（2048px/q=85）→ 首次调用
     tmp_refs: list[Path] = await asyncio.to_thread(_compress_references_to_tempfiles, constrained_refs)
     output_path: Path | None = None
     version = 0
@@ -239,6 +283,8 @@ async def execute_reference_video_task(
                 reference_images=tmp_refs,
                 aspect_ratio=project.get("aspect_ratio", "9:16"),
                 duration_seconds=effective_duration,
+                resolution=resolution,
+                task_id=task_id,
             )
         except RequestPayloadTooLargeError:
             # 二次压缩重试（1024px/q=70）
@@ -258,40 +304,73 @@ async def execute_reference_video_task(
                 reference_images=tmp_refs,
                 aspect_ratio=project.get("aspect_ratio", "9:16"),
                 duration_seconds=effective_duration,
+                resolution=resolution,
+                task_id=task_id,
             )
     finally:
         for p in tmp_refs:
             with contextlib.suppress(Exception):
                 p.unlink(missing_ok=True)
 
-    # 7. 首帧缩略图
     if output_path is None:
         raise RuntimeError("generate_video_async returned None output_path")
+
+    return await _finalize_reference_video_unit(
+        project_name=project_name,
+        script_file=script_file,
+        project_path=project_path,
+        resource_id=resource_id,
+        output_path=output_path,
+        version=version,
+        video_uri=video_uri,
+        generator=generator,
+        warnings=warnings,
+    )
+
+
+async def _finalize_reference_video_unit(
+    *,
+    project_name: str,
+    script_file: str,
+    project_path: Path,
+    resource_id: str,
+    output_path: Path,
+    version: int,
+    video_uri: str | None,
+    generator: Any,
+    warnings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normal + resume 共用：抽缩略图、写 unit.generated_assets、返回 result dict。"""
+    warnings = warnings if warnings is not None else []
+
     thumb_dir = project_path / "reference_videos" / "thumbnails"
     thumb_dir.mkdir(parents=True, exist_ok=True)
     thumb_path = thumb_dir / f"{resource_id}.jpg"
     if await extract_video_thumbnail(output_path, thumb_path):
-        thumb_rel = f"reference_videos/thumbnails/{resource_id}.jpg"
+        thumb_rel: str | None = f"reference_videos/thumbnails/{resource_id}.jpg"
     else:
         thumb_path.unlink(missing_ok=True)
         thumb_rel = None
 
-    # 8. 更新 unit.generated_assets（简单读改写 episode script）
     def _update_unit_assets():
         pm = get_project_manager()
-        script = pm.load_script(project_name, script_file)
-        for u in script.get("video_units") or []:
-            if u.get("unit_id") == resource_id:
-                ga = u.setdefault("generated_assets", {})
-                ga["video_clip"] = f"reference_videos/{resource_id}.mp4"
-                if video_uri:
-                    ga["video_uri"] = video_uri
-                if thumb_rel:
-                    ga["video_thumbnail"] = thumb_rel
-                ga["status"] = "completed"
-                break
-        pm.save_script(project_name, script, script_file)
-        return script
+        # 资产回写热路径：只动 unit.generated_assets，结构不可能因此变坏，豁免结构校验。
+        with pm.locked_script(project_name, script_file, validate=False) as script:
+            for u in script.get("video_units") or []:
+                if u.get("unit_id") == resource_id:
+                    ga = u.setdefault("generated_assets", {})
+                    ga["video_clip"] = f"reference_videos/{resource_id}.mp4"
+                    # 重跑时若新结果不含 video_uri / 缩略图，清空旧值，避免指向过期 URI / 已删除文件
+                    if video_uri:
+                        ga["video_uri"] = video_uri
+                    else:
+                        ga.pop("video_uri", None)
+                    if thumb_rel:
+                        ga["video_thumbnail"] = thumb_rel
+                    else:
+                        ga.pop("video_thumbnail", None)
+                    ga["status"] = "completed"
+                    break
 
     await asyncio.to_thread(_update_unit_assets)
 

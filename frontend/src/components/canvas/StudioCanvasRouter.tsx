@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
-import { voidPromise } from "@/utils/async";
+import { errMsg, voidPromise } from "@/utils/async";
 import { Route, Switch, Redirect } from "wouter";
 import { useTranslation } from "react-i18next";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -8,16 +8,17 @@ import { useTasksStore } from "@/stores/tasks-store";
 import { TimelineCanvas } from "./timeline/TimelineCanvas";
 import { OverviewCanvas } from "./OverviewCanvas";
 import { SourceFileViewer } from "./SourceFileViewer";
+import { SourceFilesPage } from "./SourceFilesPage";
 import { CharactersPage } from "./lorebook/CharactersPage";
 import { ScenesPage } from "./lorebook/ScenesPage";
 import { PropsPage } from "./lorebook/PropsPage";
 import { ReferenceVideoCanvas } from "./reference/ReferenceVideoCanvas";
-import { EpisodeModeSwitcher } from "./EpisodeModeSwitcher";
+import { GridImageToVideoCanvas } from "./grid/GridImageToVideoCanvas";
 import { API } from "@/api";
 import { buildEntityRevisionKey } from "@/utils/project-changes";
 import { getProviderModels, getCustomProviderModels, lookupSupportedDurations } from "@/utils/provider-models";
-import { effectiveMode, normalizeMode, type GenerationMode } from "@/utils/generation-mode";
-import type { Scene, Prop, CustomProviderInfo, ProviderInfo, EpisodeMeta } from "@/types";
+import { effectiveMode } from "@/utils/generation-mode";
+import type { Scene, Prop, CustomProviderInfo, ProviderInfo } from "@/types";
 import type { EpisodeScript } from "@/types/script";
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,9 @@ export function StudioCanvasRouter() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [customProviders, setCustomProviders] = useState<CustomProviderInfo[]>([]);
   const [globalVideoBackend, setGlobalVideoBackend] = useState("");
+  const [resolvedDurationOptions, setResolvedDurationOptions] = useState<
+    number[] | undefined
+  >(undefined);
 
   useEffect(() => {
     let disposed = false;
@@ -77,11 +81,44 @@ export function StudioCanvasRouter() {
     return () => { disposed = true; };
   }, []);
 
-  const durationOptions = useMemo(() => {
+  // 已配置 backend 时本地 lookup 即可（同步、零延迟）；未配置时调后端
+  // /video-capabilities，让 ConfigResolver 自动 fallback 到 PROVIDER_REGISTRY
+  // 第一个 ready 的 default video model（与生成路径用同一套规则，避免 FE/BE 漂移）。
+  const localDurationOptions = useMemo(() => {
     const backend = currentProjectData?.video_backend || globalVideoBackend;
     if (!backend) return undefined;
     return lookupSupportedDurations(providers, backend, customProviders);
   }, [providers, customProviders, globalVideoBackend, currentProjectData?.video_backend]);
+
+  useEffect(() => {
+    // 依赖变化时清理旧的 resolved 选项；本地 lookup 有结果或缺项目名时同步清零，
+    // 否则在异步拉取新项目的 /video-capabilities 之前先 reset 以避免沿用旧值。
+    if (localDurationOptions !== undefined) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setResolvedDurationOptions(undefined);
+      return;
+    }
+    if (!currentProjectName) {
+      setResolvedDurationOptions(undefined);
+      return;
+    }
+    setResolvedDurationOptions(undefined);
+    let disposed = false;
+    API.getVideoCapabilities(currentProjectName)
+      .then((caps) => {
+        if (disposed) return;
+        setResolvedDurationOptions(caps.supported_durations);
+      })
+      .catch(() => {
+        if (disposed) return;
+        setResolvedDurationOptions(undefined);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [currentProjectName, localDurationOptions]);
+
+  const durationOptions = localDurationOptions ?? resolvedDurationOptions;
 
   // 从任务队列派生 loading 状态（替代本地 state）
   const tasks = useTasksStore((s) => s.tasks);
@@ -146,18 +183,27 @@ export function StudioCanvasRouter() {
 
   // ---- Timeline action callbacks ----
   // These receive scriptFile from TimelineCanvas so they always use the active episode's script.
-  const handleUpdatePrompt = useCallback(async (segmentId: string, field: string, value: unknown, scriptFile?: string) => {
+  const handleUpdatePrompt = useCallback(async (
+    segmentId: string,
+    fieldOrPatch: string | Record<string, unknown>,
+    value?: unknown,
+    scriptFile?: string,
+  ) => {
     if (!currentProjectName) return;
     const mode = currentProjectData?.content_mode ?? "narration";
+    const patch =
+      typeof fieldOrPatch === "string"
+        ? { [fieldOrPatch]: value }
+        : fieldOrPatch;
     try {
       if (mode === "drama") {
-        await API.updateScene(currentProjectName, segmentId, scriptFile ?? "", { [field]: value });
+        await API.updateScene(currentProjectName, segmentId, scriptFile ?? "", patch);
       } else {
-        await API.updateSegment(currentProjectName, segmentId, { script_file: scriptFile, [field]: value });
+        await API.updateSegment(currentProjectName, segmentId, { script_file: scriptFile, ...patch });
       }
       await refreshProject();
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_prompt_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("update_prompt_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentProjectData, refreshProject]);
 
@@ -174,7 +220,7 @@ export function StudioCanvasRouter() {
       );
       useAppStore.getState().pushToast(tRef.current("storyboard_task_submitted_toast", { id: segmentId }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("generate_storyboard_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("generate_storyboard_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentScripts]);
 
@@ -192,7 +238,7 @@ export function StudioCanvasRouter() {
       );
       useAppStore.getState().pushToast(tRef.current("video_task_submitted_toast", { id: segmentId }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("generate_video_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("generate_video_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentScripts]);
 
@@ -228,7 +274,7 @@ export function StudioCanvasRouter() {
       );
       useAppStore.getState().pushToast(tRef.current("character_updated_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_character_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("update_character_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, refreshProject]);
 
@@ -244,7 +290,7 @@ export function StudioCanvasRouter() {
         .getState()
         .pushToast(tRef.current("character_task_submitted_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentProjectData]);
 
@@ -269,7 +315,7 @@ export function StudioCanvasRouter() {
       );
       useAppStore.getState().pushToast(tRef.current("character_added_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("add_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("add_failed", { message: errMsg(err) }), "error");
       throw err; // AssetFormModal onSubmit 消费：失败时阻止 setAdding(false) 关闭对话框
     }
   }, [currentProjectName, refreshProject]);
@@ -281,7 +327,7 @@ export function StudioCanvasRouter() {
       await API.updateProjectScene(currentProjectName, name, updates);
       await refreshProject();
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_scene_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("update_scene_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, refreshProject]);
 
@@ -291,7 +337,7 @@ export function StudioCanvasRouter() {
       await API.generateProjectScene(currentProjectName, name, currentProjectData?.scenes?.[name]?.description ?? "");
       useAppStore.getState().pushToast(tRef.current("scene_task_submitted_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentProjectData]);
 
@@ -302,7 +348,7 @@ export function StudioCanvasRouter() {
       await refreshProject();
       useAppStore.getState().pushToast(tRef.current("scene_added_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("add_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("add_failed", { message: errMsg(err) }), "error");
       throw err; // AssetFormModal onSubmit 消费：失败时阻止 setAdding(false) 关闭对话框
     }
   }, [currentProjectName, refreshProject]);
@@ -314,7 +360,7 @@ export function StudioCanvasRouter() {
       await API.updateProjectProp(currentProjectName, name, updates);
       await refreshProject();
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_prop_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("update_prop_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, refreshProject]);
 
@@ -324,7 +370,7 @@ export function StudioCanvasRouter() {
       await API.generateProjectProp(currentProjectName, name, currentProjectData?.props?.[name]?.description ?? "");
       useAppStore.getState().pushToast(tRef.current("prop_task_submitted_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName, currentProjectData]);
 
@@ -335,7 +381,7 @@ export function StudioCanvasRouter() {
       await refreshProject();
       useAppStore.getState().pushToast(tRef.current("prop_added_toast", { name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("add_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("add_failed", { message: errMsg(err) }), "error");
       throw err; // AssetFormModal onSubmit 消费：失败时阻止 setAdding(false) 关闭对话框
     }
   }, [currentProjectName, refreshProject]);
@@ -346,30 +392,13 @@ export function StudioCanvasRouter() {
       const result = await API.generateGrid(currentProjectName, episode, scriptFile, sceneIds);
       useAppStore.getState().pushToast(result.message, "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("grid_generation_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(tRef.current("grid_generation_failed", { message: errMsg(err) }), "error");
     }
   }, [currentProjectName]);
 
   const handleRestoreAsset = useCallback(async () => {
     await refreshProject();
   }, [refreshProject]);
-
-  const handleEpisodeModeChange = useCallback(
-    async (epNum: number, next: GenerationMode) => {
-      if (!currentProjectName) return;
-      const episodes = [{ episode: epNum, generation_mode: next }] as EpisodeMeta[];
-      try {
-        await API.updateProject(currentProjectName, { episodes });
-        await refreshProject();
-      } catch (err) {
-        useAppStore.getState().pushToast(
-          tRef.current("update_failed", { message: (err as Error).message }),
-          "error",
-        );
-      }
-    },
-    [currentProjectName, refreshProject],
-  );
 
   const handleGenerateCharacterVoid = useCallback((...args: Parameters<typeof handleGenerateCharacter>) => {
     void handleGenerateCharacter(...args).catch(console.error);
@@ -410,6 +439,10 @@ export function StudioCanvasRouter() {
 
       <Route path="/clues">
         <Redirect to="/scenes" />
+      </Route>
+
+      <Route path="/source">
+        <SourceFilesPage projectName={currentProjectName} />
       </Route>
 
       <Route path="/characters">
@@ -467,33 +500,26 @@ export function StudioCanvasRouter() {
           const scriptFile = episode?.script_file?.replace(/^scripts\//, "");
           const script = scriptFile ? (currentScripts[scriptFile] ?? null) : null;
           const mode = effectiveMode(currentProjectData, episode);
-          const projectMode = normalizeMode(currentProjectData?.generation_mode);
-          const episodeOverride = episode?.generation_mode
-            ? normalizeMode(episode.generation_mode)
-            : undefined;
           const hasDraft =
             episode?.script_status === "segmented" || episode?.script_status === "generated";
 
           return (
             <div className="flex h-full flex-col">
-              <div className="border-b border-gray-800 px-4 py-2">
-                <EpisodeModeSwitcher
-                  projectMode={projectMode}
-                  episodeMode={episodeOverride}
-                  onChange={(next) => void handleEpisodeModeChange(epNum, next)}
-                />
-              </div>
               <div className="min-h-0 flex-1">
                 {mode === "reference_video" ? (
                   <ReferenceVideoCanvas
-                    key={epNum}
+                    // 同一 epNum 跨项目不 remount 会让 optimisticUnitIds / prevTaskStatusRef
+                    // 残留上个项目的状态（例如 "E1U1" 长驻 set 里），切到同名 unit 的新项目
+                    // 时 "optimistic && !hasQueueRow" 会误判 busy。改 key 到 project::episode
+                    // 让实例天然按项目隔离，避免显式 pruning 逻辑。
+                    key={`${currentProjectName}::${epNum}`}
                     projectName={currentProjectName}
                     episode={epNum}
                     episodeTitle={episode?.title}
                   />
-                ) : (
-                  <TimelineCanvas
-                    key={epNum}
+                ) : mode === "grid" ? (
+                  <GridImageToVideoCanvas
+                    key={`${currentProjectName}::${epNum}`}
                     projectName={currentProjectName}
                     episode={epNum}
                     episodeTitle={episode?.title}
@@ -502,10 +528,30 @@ export function StudioCanvasRouter() {
                     scriptFile={scriptFile ?? undefined}
                     projectData={currentProjectData}
                     durationOptions={durationOptions}
-                    onUpdatePrompt={voidPromise(handleUpdatePrompt)}
+                    onUpdatePrompt={handleUpdatePrompt}
                     onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
                     onGenerateVideo={voidPromise(handleGenerateVideo)}
-                    onGenerateGrid={voidPromise(handleGenerateGrid)}
+                    onGenerateGrid={handleGenerateGrid}
+                    onRestoreStoryboard={handleRestoreAsset}
+                    onRestoreVideo={handleRestoreAsset}
+                  />
+                ) : (
+                  <TimelineCanvas
+                    // 和 ReferenceVideoCanvas (上方) 同理：同 epNum 跨项目不 remount
+                    // 会让 TimelineCanvas 内部的 useState / useRef（选中 scene、草稿缓冲、
+                    // 滚动位置等）残留上一个项目的值。key 带上 projectName 天然按项目隔离。
+                    key={`${currentProjectName}::${epNum}`}
+                    projectName={currentProjectName}
+                    episode={epNum}
+                    episodeTitle={episode?.title}
+                    hasDraft={hasDraft}
+                    episodeScript={script}
+                    scriptFile={scriptFile ?? undefined}
+                    projectData={currentProjectData}
+                    durationOptions={durationOptions}
+                    onUpdatePrompt={handleUpdatePrompt}
+                    onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
+                    onGenerateVideo={voidPromise(handleGenerateVideo)}
                     onRestoreStoryboard={handleRestoreAsset}
                     onRestoreVideo={handleRestoreAsset}
                   />

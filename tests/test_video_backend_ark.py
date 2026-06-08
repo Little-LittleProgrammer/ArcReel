@@ -107,7 +107,7 @@ class TestArkGenerate:
         assert result.task_id == "cgt-20250101-test"
 
     async def test_image_to_video(self, backend, tmp_path):
-        """图生视频：有 start_image。"""
+        """图生视频：有 start_image，必须带 role=first_frame。"""
         output = tmp_path / "out.mp4"
         frame = tmp_path / "scene_E1S01.png"
         frame.write_bytes(b"fake-png")
@@ -144,6 +144,86 @@ class TestArkGenerate:
         assert len(content_arg) == 2
         assert content_arg[1]["type"] == "image_url"
         assert content_arg[1]["image_url"]["url"].startswith("data:image/")
+        assert content_arg[1]["role"] == "first_frame"
+
+    async def test_first_last_frame_role_fields(self, backend, tmp_path):
+        """首尾帧：start_image/end_image 必须分别带 role=first_frame / role=last_frame，
+        且 image_url 对象不再使用 position（由 role 表达位置）。"""
+        output = tmp_path / "out.mp4"
+        first = tmp_path / "first.png"
+        first.write_bytes(b"fake-first")
+        last = tmp_path / "last.png"
+        last.write_bytes(b"fake-last")
+
+        create_result = MagicMock()
+        create_result.id = "cgt-fl-test"
+        backend._client.content_generation.tasks.create = MagicMock(return_value=create_result)
+
+        get_result = MagicMock()
+        get_result.status = "succeeded"
+        get_result.content = MagicMock()
+        get_result.content.video_url = "https://cdn.example.com/video.mp4"
+        get_result.seed = None
+        get_result.usage = None
+        backend._client.content_generation.tasks.get = MagicMock(return_value=get_result)
+
+        patcher = _mock_httpx_stream()
+        try:
+            request = VideoGenerationRequest(
+                prompt="morph",
+                output_path=output,
+                start_image=first,
+                end_image=last,
+            )
+            await backend.generate(request)
+        finally:
+            patcher.stop()
+
+        create_kwargs = backend._client.content_generation.tasks.create.call_args.kwargs
+        content_arg = create_kwargs["content"]
+        image_items = [c for c in content_arg if c["type"] == "image_url"]
+        assert len(image_items) == 2
+        assert image_items[0]["role"] == "first_frame"
+        assert image_items[1]["role"] == "last_frame"
+        # role 表达位置后，不应再塞 position 到 image_url
+        assert "position" not in image_items[1]["image_url"]
+
+    async def test_reference_images_role(self, backend, tmp_path):
+        """参考图：每张 reference_images 必须带 role=reference_image（Ark 多图触发条件）。"""
+        output = tmp_path / "out.mp4"
+        ref1 = tmp_path / "ref1.jpg"
+        ref1.write_bytes(b"fake-ref-1")
+        ref2 = tmp_path / "ref2.jpg"
+        ref2.write_bytes(b"fake-ref-2")
+
+        create_result = MagicMock()
+        create_result.id = "cgt-refs-test"
+        backend._client.content_generation.tasks.create = MagicMock(return_value=create_result)
+
+        get_result = MagicMock()
+        get_result.status = "succeeded"
+        get_result.content = MagicMock()
+        get_result.content.video_url = "https://cdn.example.com/video.mp4"
+        get_result.seed = None
+        get_result.usage = None
+        backend._client.content_generation.tasks.get = MagicMock(return_value=get_result)
+
+        patcher = _mock_httpx_stream()
+        try:
+            request = VideoGenerationRequest(
+                prompt="[图1] 与 [图2] 对话",
+                output_path=output,
+                reference_images=[ref1, ref2],
+            )
+            await backend.generate(request)
+        finally:
+            patcher.stop()
+
+        create_kwargs = backend._client.content_generation.tasks.create.call_args.kwargs
+        content_arg = create_kwargs["content"]
+        image_items = [c for c in content_arg if c["type"] == "image_url"]
+        assert len(image_items) == 2
+        assert all(item["role"] == "reference_image" for item in image_items)
 
     async def test_failed_task_raises(self, backend, tmp_path):
         output = tmp_path / "out.mp4"
@@ -321,18 +401,45 @@ class TestArkModelCapabilities:
         caps = b.capabilities
         assert VideoCapability.FLEX_TIER in caps
 
+    def test_seedance_2_dot_format_no_flex_tier(self):
+        """ark-agent-plan 用 dot 命名（doubao-seedance-2.0），同样不该带 FLEX_TIER。"""
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="doubao-seedance-2.0")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
+    def test_seedance_2_fast_dot_format_no_flex_tier(self):
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="doubao-seedance-2.0-fast")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
+    def test_seedance_2_dreamina_prefix_no_flex_tier(self):
+        """BytePlus 国际站用 dreamina- 前缀（dreamina-seedance-2-0-260128），同族不该带 FLEX_TIER。"""
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="dreamina-seedance-2-0-260128")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
+    def test_seedance_2_dreamina_fast_prefix_no_flex_tier(self):
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="dreamina-seedance-2-0-fast-260128")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
 
 class TestArkServiceTierParam:
     """service_tier 只对声明了 FLEX_TIER 能力的模型传入，否则 API 会报错。"""
 
-    async def test_seedance_2_does_not_send_service_tier(self, tmp_path):
+    @pytest.mark.parametrize(
+        "model",
+        ["doubao-seedance-2-0-260128", "dreamina-seedance-2-0-260128"],
+    )
+    async def test_seedance_2_does_not_send_service_tier(self, tmp_path, model):
+        """seedance-2 系列（含 dreamina- 前缀的自定义供应商命名）不得发 service_tier，否则 r2v 上游 400。"""
         output = tmp_path / "out.mp4"
         mock_client = MagicMock()
         mock_client.content_generation = MagicMock()
         mock_client.content_generation.tasks = MagicMock()
 
         with patch("lib.video_backends.ark.create_ark_client", return_value=mock_client):
-            backend = ArkVideoBackend(api_key="test", model="doubao-seedance-2-0-260128")
+            backend = ArkVideoBackend(api_key="test", model=model)
         backend._client = mock_client
 
         create_result = MagicMock()
@@ -383,3 +490,46 @@ class TestArkServiceTierParam:
 
         create_kwargs = backend._client.content_generation.tasks.create.call_args.kwargs
         assert create_kwargs.get("service_tier") == "default"
+
+
+class TestArkVideoBackendBaseUrl:
+    def test_custom_base_url_passed_through(self):
+        with patch("lib.video_backends.ark.create_ark_client") as mock_create:
+            ArkVideoBackend(api_key="k", base_url="https://ark.cn-beijing.volces.com/api/plan/v3")
+            mock_create.assert_called_once_with(
+                api_key="k",
+                base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            )
+
+    def test_default_base_url_is_none(self):
+        with patch("lib.video_backends.ark.create_ark_client") as mock_create:
+            ArkVideoBackend(api_key="k")
+            mock_create.assert_called_once_with(api_key="k", base_url=None)
+
+
+class TestIsArkNotFound:
+    """fix #647 #6：用 task_not_found / tasknotfound 精确匹配，剔除宽泛 "not found" 兜底；
+    保留 "expired" 字串识别（_poll_until_done 把 status=expired 转 RuntimeError）。"""
+
+    def test_excludes_business_not_found(self):
+        from lib.video_backends.ark import _is_ark_not_found
+
+        exc = RuntimeError("reference image not found in storage")
+        assert _is_ark_not_found(exc) is False
+
+    def test_recognizes_task_not_found(self):
+        from lib.video_backends.ark import _is_ark_not_found
+
+        assert _is_ark_not_found(RuntimeError("task_not_found: invalid id")) is True
+
+    def test_recognizes_expired_status(self):
+        from lib.video_backends.ark import _is_ark_not_found
+
+        assert _is_ark_not_found(RuntimeError("Ark 任务失败 ... status=expired")) is True
+
+    def test_recognizes_404(self):
+        from lib.video_backends.ark import _is_ark_not_found
+
+        exc = RuntimeError("any")
+        exc.status_code = 404  # type: ignore[attr-defined]
+        assert _is_ark_not_found(exc) is True

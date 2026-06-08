@@ -29,7 +29,7 @@
 
 - **四家供应商全覆盖**：Ark Seedance 2.0 / 2.0 fast（首推）、Grok grok-imagine-video、Gemini Veo、OpenAI Sora。
 - **项目级 + 集级**「生成模式」选择器（命名：**图生视频 / 宫格生视频 / 参考生视频**）。
-- 独立 Episode 脚本数据模型（`content_mode` 新增第三种值 `reference_video`，使用 `video_units[]` 替代 `segments[]/scenes[]`）。
+- 独立 Episode 脚本数据模型（脚本通过 `generation_mode == "reference_video"` 标识，使用 `video_units[]` 替代 `segments[]/scenes[]`）。
 - multi-shot prompt + `@` 提及式参考图语法。
 - 参考图上传/生成后调用前临时压缩（不落盘）。
 - 新路由 / 服务 / 任务 executor；复用现有 GenerationQueue + Worker + VideoBackends + MediaGenerator + UsageTracker。
@@ -89,18 +89,17 @@ GenerationModeSelector (三选)        ↓                                genera
 **`generation_mode` 与 `content_mode` 的关系**
 
 - `project.generation_mode` 是意图字段，UI / Agent 据此决定生成哪种形态的脚本。
-- `script.content_mode`（episode JSON 内字段）是脚本形态的 discriminator，三种取值：
-  - `"narration"` — 配合 `generation_mode ∈ {storyboard, grid}`，脚本含 `segments[]`
-  - `"drama"` — 配合 `generation_mode ∈ {storyboard, grid}`，脚本含 `scenes[]`
-  - `"reference_video"` — 配合 `generation_mode == "reference_video"`，脚本含 `video_units[]`
-- 当 `effective_mode == "reference_video"` 时，`project.content_mode` 字段被视为占位；脚本的 `content_mode` 强制为 `"reference_video"`。
+- 脚本（episode JSON）携 `content_mode` 与 `generation_mode` 两个独立维度字段，二者共同决定脚本形态：
+  - `content_mode ∈ {narration, drama}` — 内容类型维度，承载剧本结构（`segments[]` / `scenes[]`）
+  - `generation_mode` — 视频来源维度：`storyboard` / `grid` 用 `segments[]`/`scenes[]`；`reference_video` 用 `video_units[]`
+- 当 `effective_mode == "reference_video"` 时，脚本顶层 `generation_mode` 固定为 `"reference_video"`；`content_mode` 仍保留 narration/drama 取值但参考模式下不区分（占位，由 `_add_metadata` 注入）。两字段都对 LLM 隐藏（`SkipJsonSchema`）。
 
 ### 4.2 `ReferenceVideoScript` Pydantic 模型（`lib/script_models.py`）
 
 ```python
 class Shot(BaseModel):
     duration: int = Field(ge=1, le=15, description="该镜头时长（秒）")
-    text: str = Field(description="镜头描述，可包含 @角色/@场景 引用")
+    text: str = Field(description="镜头描述，可包含 @角色/@场景/@道具 引用")
 
 class ReferenceResource(BaseModel):
     type: Literal["character", "scene", "prop"] = Field(description="引用的资源类型")
@@ -108,19 +107,24 @@ class ReferenceResource(BaseModel):
 
 class ReferenceVideoUnit(BaseModel):
     unit_id: str = Field(description="格式 E{集}U{序号}")
-    shots: list[Shot] = Field(min_length=1, description="1-4 个 shot")
-    references: list[ReferenceResource] = Field(description="按顺序决定 [图N] 编号")
+    shots: list[Shot] = Field(min_length=1, max_length=4, description="1-4 个 shot")
+    references: list[ReferenceResource] = Field(default_factory=list, description="按顺序决定 [图N] 编号")
     duration_seconds: int = Field(description="派生字段：所有 shot 时长之和")
-    duration_override: bool = Field(default=False, description="true 时停止自动派生")
-    transition_to_next: Literal["cut", "fade", "dissolve"] = "cut"
-    note: str | None = None
-    generated_assets: GeneratedAssets = Field(default_factory=GeneratedAssets)
+    # 以下对 LLM 隐藏（SkipJsonSchema）
+    duration_override: SkipJsonSchema[bool] = Field(default=False, description="true 时停止自动派生")
+    transition_to_next: TransitionType = Field(default="cut", description="转场类型")
+    note: SkipJsonSchema[str | None] = None
+    generated_assets: SkipJsonSchema[GeneratedAssets] = Field(default_factory=GeneratedAssets)
+
+    # @model_validator: duration_override=False 时校验 duration_seconds == sum(shot.duration)
 
 class ReferenceVideoScript(BaseModel):
-    episode: int
+    # 无 episode 字段——集号由 CLI 真相源通过 _add_metadata 写入
     title: str
-    content_mode: Literal["reference_video"]
-    duration_seconds: int = 0
+    # content_mode / generation_mode 均对 LLM 隐藏，由 _add_metadata 注入
+    content_mode: SkipJsonSchema[Literal["narration", "drama"]] = "narration"
+    generation_mode: SkipJsonSchema[Literal["reference_video"]] = "reference_video"
+    duration_seconds: SkipJsonSchema[int] = 0
     summary: str
     novel: NovelInfo
     video_units: list[ReferenceVideoUnit]
@@ -441,15 +445,18 @@ python scripts/verify_reference_video_sdks.py --provider {ark|grok|veo|sora} --r
 | M5 Agent 工作流 | split-reference-video-units subagent、generate-script / generate-video 扩展、manga-workflow 分支、CLAUDE.md 更新 |
 | M6 联调 + 发版 | 端到端跑通、i18n 校验、覆盖率达标、合并 |
 
-## 11. 未决 / 留给实施计划
+## 11. 已决议（PR7 M6 结论，取代原"未决"段）
 
-- 预处理 subagent 的 LLM prompt 模板细节（v1 通过 M5 阶段设计）。
-- Sora 真实能力验证结果决定是否完全隐藏 Sora 参考模式选项或降级为单图（M1 产出）。
-- **切换集级 generation_mode 的处理策略**：从 `storyboard/grid` 切到 `reference_video` 时，是否清空旧 segments 并提示重跑预处理；反向切换是否保留 `video_units`。v1 默认：切换时仅修改字段，**不主动删除** 旧数据；Canvas 按 effective_mode 渲染对应视图；实施计划需给出 UI 提示文案。
-- 视频生成 `generate_audio` 的默认值在 `project.video_model_settings` 不存在时的 fallback（推荐 `true`，但需要实施阶段与现有 storyboard 行为对齐确认）。
-- **schema_version 升级策略**：main 当前 `CURRENT_SCHEMA_VERSION = 1`（v0→v1 拆 clues）。新增顶层 `generation_mode` + 新脚本形态 `content_mode == "reference_video"` + 新目录 `reference_videos/` 是否需要 bump 到 v2 并提供 `v1_to_v2` 迁移器？
-  - 倾向：**不 bump**。`generation_mode` 缺省按 `effective_mode()` 回退 `"storyboard"`，`video_units` 仅在新模式下写入，对旧项目零影响。
-  - 若决定 bump：实施阶段需新增 `lib/project_migrations/v1_to_v2_*.py`，内容仅限"补 `generation_mode: "storyboard"` 默认字段"。此为实施 M2/M3 阶段要拍板的点。
+> PR7（2026-04-20）把原 M6 里遗留的 4 个决策点逐条落地如下。所有项都已反映到代码与 i18n 文案。原 subagent prompt 模板的细节已在 PR6（#337）落地。
+
+- **`generate_audio` 默认值**：改为 `True`（`lib/config/resolver.py` 的 `_DEFAULT_VIDEO_GENERATE_AUDIO = True`；`lib/media_generator.py` `_config is None` 的 fallback 同步改 `True`；`server/routers/system_config.py` GET 响应默认值一并对齐 `"true"`，避免 UI 与 pipeline 分歧）。理由：与 Seedance / Grok 默认开启一致，storyboard 用户期望亦如此。
+- **集级 `generation_mode` 切换策略**：**不清空** 旧数据；`EpisodeModeSwitcher` 改为在切换时弹 `"info"` kind 的 toast，明示"旧数据保留，可随时切回继续"（对应 i18n key：`episode_mode_switch_to_reference` / `episode_mode_switch_from_reference` / `episode_mode_switch_keep_data`）。Canvas 继续按 `effective_mode` 渲染对应视图，不做数据迁移。
+- **`schema_version`**：**不 bump**，继续 v1。新增的 `generation_mode` 顶层字段与 `video_units[]` 子树对旧项目缺省不可见；`effective_mode()` 缺省回退 `storyboard`，所以 v0→v1 迁移器无需改动、不新增 v1→v2 迁移器。
+- **Sora 参考模式可见性**：保守方案——**保留可选，走 `_apply_provider_constraints` 的 `ref_sora_single_ref` 单图降级分支**。
+  - 依据：PR7 Task 14 在 CI 环境无 API key 运行 `scripts/verify_reference_video_sdks.py` 失败，live 验证 pending（详见 `docs/verification-reports/reference-video-sdks-2026-04-20.md`）。
+  - `lib/reference_video/limits.py` 将 Sora `max_refs=1`，executor 会自动截断 `references[:1]` + 回传 `ref_sora_single_ref` warning；UI 透明展示给用户。
+  - 若 live 验证后确认 Sora 多图完全不可用，升级为"前端 `GenerationModeSelector` 在 Sora 路径隐藏参考生视频选项"——本次不隐藏。
+  - 若升级为支持 ≥ 2 图，调整 `PROVIDER_MAX_REFS["openai"]` 即可放宽。
 
 ## 附录 A：关键文件改动清单
 
@@ -503,12 +510,14 @@ agent_runtime_profile/.claude/references/content-modes.md  → generation-modes.
 - `server/routers/_bucket_router_factory.py`、`server/routers/{scenes,props,characters,assets}.py`——参考模式不改 bucket 路由；同构的 unit CRUD 可考虑复用该 factory 生成（可选优化）。
 - `frontend/src/stores/assets-store.ts` / `frontend/src/components/layout/AssetSidebar.tsx` / `frontend/src/i18n/{zh,en}/assets.ts`——MentionPicker 直接复用。
 
-## 附录 B：供应商能力矩阵（待 M1 SDK 验证后回填）
+## 附录 B：供应商能力矩阵
+
+> PR7 Task 14 在 CI 环境尝试运行 `scripts/verify_reference_video_sdks.py`，四家因 API key 缺失未能完成真实调用（live validation pending）。以下数值取自 `lib/reference_video/limits.py`（single source of truth）+ 供应商文档。详见 `docs/verification-reports/reference-video-sdks-2026-04-20.md`。
 
 | 供应商 | 最大参考图 | 最大时长 | multi-shot 可靠性 | generate_audio | 备注 |
 |---|---|---|---|---|---|
-| Ark Seedance 2.0 | 9 | 15s | 已验证（文档） | ✅ | 首推 |
-| Ark Seedance 2.0 fast | 9 | 15s | 已验证（文档） | ✅ | 快模式 |
-| Grok grok-imagine-video | 7 | 待验证 | 待验证 | ✅（默认） | 请求体大小待验证 |
-| Gemini Veo | 3 | 8s | 受限 | ✅（Vertex） | clamp duration |
-| OpenAI Sora | 1-3（待验证） | 12s | **重点验证项** | - | 可能降级为单图 |
+| Ark Seedance 2.0 | 9 | 15s | 文档声明支持 | ✅ | 首推；live 验证 pending (PR7) |
+| Ark Seedance 2.0 fast | 9 | 15s | 文档声明支持 | ✅ | 快模式；live 验证 pending (PR7) |
+| Grok grok-imagine-video | 7 | 15s | 文档声明支持 | ✅（默认） | 请求体大小待 live 验证 |
+| Gemini Veo | 3 | 8s | 受限 | ✅（Vertex） | executor 已 clamp；基于 SDK 文档 |
+| OpenAI Sora | 1（当前 limits.py） | 12s | **待 live 验证** | - | spec §11 第 4 项决策依赖；未 live 验证前按单图降级 |

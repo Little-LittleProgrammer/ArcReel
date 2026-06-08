@@ -35,7 +35,8 @@ const mockData = {
   customProviders: [],
   globalDefaults: {
     video: "gemini-aistudio/veo-3",
-    image: "gemini-aistudio/nano-banana",
+    imageT2I: "gemini-aistudio/nano-banana",
+    imageI2I: "gemini-aistudio/nano-banana",
     textScript: "",
     textOverview: "",
     textStyle: "",
@@ -44,11 +45,14 @@ const mockData = {
 
 const baseValue = {
   videoBackend: "",
-  imageBackend: "",
+  imageBackendT2I: "",
+  imageBackendI2I: "",
   textBackendScript: "",
   textBackendOverview: "",
   textBackendStyle: "",
   defaultDuration: null,
+  videoResolution: null,
+  imageResolution: null,
 };
 
 describe("WizardStep2Models", () => {
@@ -80,7 +84,8 @@ describe("WizardStep2Models", () => {
       />,
     );
     expect(screen.queryByText(/loading|加载中/i)).not.toBeInTheDocument();
-    // 1 video + 1 image + 3 text = 5 selectors
+    // 5 selectors — image 默认单下拉（仅当模型 caps 单一时才露出第 2 个）：
+    // 1 video + 1 image + 3 text
     expect(screen.getAllByRole("combobox")).toHaveLength(5);
   });
 

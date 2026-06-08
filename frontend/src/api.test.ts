@@ -51,6 +51,8 @@ function makeTask(overrides: Partial<TaskItem> = {}): TaskItem {
     result: null,
     error_message: null,
     cancelled_by: null,
+    provider_id: null,
+    provider_job_id: null,
     source: "webui",
     queued_at: "2026-02-01T00:00:00Z",
     started_at: null,
@@ -141,13 +143,27 @@ describe("API", () => {
       );
       vi.stubGlobal("fetch", fetchMock);
       const clearTokenMock = vi.spyOn(await import("@/utils/auth"), "clearToken");
-      const location = { href: "/app" };
+      // /app（无尾斜杠）不属于 /app/ 受保护页面，重定向不应附带 from。
+      const location = { href: "", pathname: "/app", search: "", hash: "" };
       vi.stubGlobal("location", location);
 
       await expect(API.request("/projects")).rejects.toThrow("认证已过期，请重新登录");
 
       expect(clearTokenMock).toHaveBeenCalledTimes(1);
       expect(location.href).toBe("/login");
+    });
+
+    it("appends the current /app path as ?from when redirecting on 401", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        mockResponse({ ok: false, status: 401, statusText: "Unauthorized" }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const location = { href: "", pathname: "/app/projects/demo", search: "", hash: "" };
+      vi.stubGlobal("location", location);
+
+      await expect(API.request("/projects")).rejects.toThrow("认证已过期，请重新登录");
+
+      expect(location.href).toBe("/login?from=%2Fapp%2Fprojects%2Fdemo");
     });
   });
 
@@ -180,6 +196,7 @@ describe("API", () => {
       await API.updateSegment("demo", "segment-1", { y: 2 });
 
       await API.getSystemConfig();
+      await API.getSystemVersion();
       await API.updateSystemConfig({ default_image_backend: "vertex" });
       await API.listFiles("demo");
       await API.listDrafts("demo");
@@ -230,7 +247,7 @@ describe("API", () => {
       expect(requestSpy).toHaveBeenCalledWith(
         "/projects/demo/scripts/episode%201.json",
       );
-      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/scenes/scene-1", {
+      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/script-scenes/scene-1", {
         method: "PATCH",
         body: JSON.stringify({ script_file: "episode_1.json", updates: { x: 1 } }),
       });
@@ -239,6 +256,7 @@ describe("API", () => {
         body: JSON.stringify({ y: 2 }),
       });
       expect(requestSpy).toHaveBeenCalledWith("/system/config");
+      expect(requestSpy).toHaveBeenCalledWith("/system/version");
       expect(requestSpy).toHaveBeenCalledWith("/system/config", {
         method: "PATCH",
         body: JSON.stringify({ default_image_backend: "vertex" }),
@@ -641,6 +659,63 @@ describe("API", () => {
       expect(clearTokenMock).toHaveBeenCalledTimes(1);
       expect(location.href).toBe("/login");
     });
+
+    describe("downloadDiagnostics", () => {
+      it("parses filename from Content-Disposition and returns blob", async () => {
+        const blob = new Blob(["zip-bytes"], { type: "application/zip" });
+        const fetchMock = vi.fn().mockResolvedValue(
+          mockResponse({
+            blobData: blob,
+            headers: {
+              "Content-Disposition": 'attachment; filename="arcreel-diagnostics-2026-05-19-0700Z.zip"',
+            },
+          }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        const result = await API.downloadDiagnostics();
+
+        expect(result.filename).toBe("arcreel-diagnostics-2026-05-19-0700Z.zip");
+        expect(result.blob).toBe(blob);
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/v1/system/logs/download",
+          expect.objectContaining({ method: "GET" }),
+        );
+      });
+
+      it("falls back to default filename when Content-Disposition is missing", async () => {
+        const fetchMock = vi.fn().mockResolvedValue(
+          mockResponse({ blobData: new Blob() }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        const result = await API.downloadDiagnostics();
+        expect(result.filename).toBe("arcreel-diagnostics.zip");
+      });
+
+      it("triggers unauthorized handling on 401", async () => {
+        const fetchMock = vi.fn().mockResolvedValue(
+          mockResponse({ ok: false, status: 401, statusText: "Unauthorized" }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        const clearTokenMock = vi.spyOn(await import("@/utils/auth"), "clearToken");
+        const location = { href: "", pathname: "/app/settings", search: "", hash: "" };
+        vi.stubGlobal("location", location);
+
+        await expect(API.downloadDiagnostics()).rejects.toThrow("认证已过期，请重新登录");
+        expect(clearTokenMock).toHaveBeenCalledTimes(1);
+        expect(location.href).toBe("/login?from=%2Fapp%2Fsettings");
+      });
+
+      it("throws on other HTTP errors", async () => {
+        const fetchMock = vi.fn().mockResolvedValue(
+          mockResponse({ ok: false, status: 500, statusText: "Internal Server Error", textData: "boom" }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        await expect(API.downloadDiagnostics()).rejects.toThrow();
+      });
+    });
   });
 
   describe("openTaskStream", () => {
@@ -787,8 +862,7 @@ describe("API", () => {
 import type { ReferenceVideoUnit } from "@/types";
 
 describe("API.referenceVideos", () => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let fetchMock: ReturnType<typeof vi.fn> & { mock: { calls: any[] } };
+  let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     fetchMock = vi.spyOn(globalThis, "fetch");

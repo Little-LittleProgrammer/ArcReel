@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from lib.asset_types import ASSET_TYPES
+from lib.asset_types import ASSET_SPECS, ASSET_TYPES
 from lib.json_io import load_json_or_none
+from lib.project_manager import effective_mode
 
 
 @dataclass
@@ -40,9 +41,9 @@ class ValidationResult:
 class DataValidator:
     """数据验证器"""
 
-    VALID_CONTENT_MODES = {"narration", "drama", "reference_video"}
-    VALID_DURATIONS = {4, 6, 8}
-    VALID_SCENE_TYPES = {"剧情", "空镜"}
+    # content_mode 严格只表达"内容类型"；"视频来源"维度由 generation_mode 字段
+    # 表达，通过 project_manager.effective_mode 解析。
+    VALID_CONTENT_MODES = {"narration", "drama"}
     VALID_SHOT_DURATION_RANGE = (1, 15)
     ID_PATTERN = re.compile(r"^E\d+S\d+(?:_\d+)?$")
     EXTERNAL_URI_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -67,18 +68,20 @@ class DataValidator:
         "grids",
     }
 
-    def __init__(self, projects_root: str | None = None):
+    def __init__(self, projects_root: str | Path | None = None):
         """
         初始化验证器
 
         Args:
-            projects_root: 项目根目录，默认为 projects/
+            projects_root: 项目根目录；默认走 ``app_data_dir()``
+                （兼顾 ``ARCREEL_DATA_DIR`` / ``AI_ANIME_PROJECTS`` env）。
         """
-        import os
-
         if projects_root is None:
-            projects_root = os.environ.get("AI_ANIME_PROJECTS", "projects")
-        self.projects_root = Path(projects_root)
+            from lib.app_data_dir import app_data_dir
+
+            self.projects_root = app_data_dir()
+        else:
+            self.projects_root = Path(projects_root)
 
     @staticmethod
     def _is_hidden_path(path: Path) -> bool:
@@ -159,8 +162,10 @@ class DataValidator:
         errors: list[str],
         warnings: list[str],
     ) -> None:
-        if not project.get("title"):
+        if "title" not in project:
             errors.append("缺少必填字段: title")
+        elif not isinstance(project["title"], str):
+            errors.append("字段类型错误: title 应为字符串")
 
         content_mode = project.get("content_mode")
         if not content_mode:
@@ -194,12 +199,23 @@ class DataValidator:
 
         characters = project.get("characters", {})
         if isinstance(characters, dict):
+            char_extra_fields = ASSET_SPECS["character"].extra_string_fields
             for char_name, char_data in characters.items():
                 if not isinstance(char_data, dict):
                     errors.append(f"角色 '{char_name}' 数据格式错误，应为对象")
                     continue
-                if not char_data.get("description"):
-                    errors.append(f"角色 '{char_name}' 缺少必填字段: description")
+                desc = char_data.get("description")
+                if not isinstance(desc, str) or not desc:
+                    # 必须是非空字符串：description 是 LLM 直写字段，agent 误传数字/对象
+                    # 应在守卫点 fail-loud，否则会作为合法资产落盘、下游消费时才崩
+                    errors.append(f"角色 '{char_name}' 缺少必填字段: description（须为非空字符串）")
+                for field_name in char_extra_fields:
+                    # spec 声明的 extra_string_fields（voice_style / reference_image 等）若存在
+                    # 须为字符串（可空），否则下游消费方（如把 reference_image 当路径拼接）
+                    # 会运行时崩。None 视为「未设置」放行，非 str 类型 fail-loud。
+                    val = char_data.get(field_name)
+                    if val is not None and not isinstance(val, str):
+                        errors.append(f"角色 '{char_name}'.{field_name} 必须是字符串，当前为 {type(val).__name__}")
 
         if project.get("clues") is not None:
             errors.append("project.json 含已废弃字段 clues，请等待自动迁移或手动重启服务")
@@ -228,12 +244,22 @@ class DataValidator:
         if not isinstance(catalog, dict):
             errors.append(f"{field_label} 必须是对象")
             return
+        # scene/prop 的 extra_string_fields 当前均为空 tuple（见 ASSET_SPECS），仍按 spec 取
+        # 以保持「validator 跟 spec 同步」——将来给 scenes/props 加 extra 字段时无需改本处。
+        asset_type = field_label.rstrip("s")  # "scenes" → "scene"; "props" → "prop"
+        extra_fields = ASSET_SPECS[asset_type].extra_string_fields if asset_type in ASSET_SPECS else ()
         for name, data in catalog.items():
             if not isinstance(data, dict):
                 errors.append(f"{kind_label} '{name}' 数据格式错误，应为对象")
                 continue
-            if not data.get("description"):
-                errors.append(f"{kind_label} '{name}' 缺少必填字段: description")
+            desc = data.get("description")
+            if not isinstance(desc, str) or not desc:
+                # 同 characters：description 须为非空字符串，避免数字/对象被 truthy 判通过
+                errors.append(f"{kind_label} '{name}' 缺少必填字段: description（须为非空字符串）")
+            for field_name in extra_fields:
+                val = data.get(field_name)
+                if val is not None and not isinstance(val, str):
+                    errors.append(f"{kind_label} '{name}'.{field_name} 必须是字符串，当前为 {type(val).__name__}")
 
     def _validate_segment_refs(
         self,
@@ -255,6 +281,17 @@ class DataValidator:
         invalid = set(refs) - valid_set
         if invalid:
             errors.append(f"{prefix}: {field_label} 引用了不存在于 project.json 的{kind_label}: {invalid}")
+
+    def validate_project_payload(self, project: dict[str, Any]) -> ValidationResult:
+        """对内存中的 project.json dict 做结构校验（不读盘）。
+
+        供写入前校验复用——`patch_project` 在 `update_project` 的 mutation 内 apply 改动后、
+        落盘前调用本方法，非法则中止写入，避免「先写后验、失败仍留脏数据」。
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+        self._validate_project_payload(project, errors, warnings)
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
 
     def validate_project(self, project_name: str) -> ValidationResult:
         """验证 project.json"""
@@ -347,8 +384,8 @@ class DataValidator:
             duration = segment.get("duration_seconds")
             if duration is None:
                 warnings.append(f"{prefix}: 缺少 duration_seconds，将使用默认值 4")
-            elif duration not in self.VALID_DURATIONS:
-                errors.append(f"{prefix}: duration_seconds 值无效 '{duration}'，必须是 {self.VALID_DURATIONS}")
+            elif not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0:
+                errors.append(f"{prefix}: duration_seconds 值无效 '{duration}'，必须为正整数")
 
             if not segment.get("novel_text"):
                 errors.append(f"{prefix}: 缺少必填字段 novel_text")
@@ -420,17 +457,11 @@ class DataValidator:
             elif not self.ID_PATTERN.match(scene_id):
                 errors.append(f"{prefix}: scene_id 格式错误 '{scene_id}'，应为 E{{n}}S{{nn}}")
 
-            scene_type = scene.get("scene_type")
-            if not scene_type:
-                errors.append(f"{prefix}: 缺少必填字段 scene_type")
-            elif scene_type not in self.VALID_SCENE_TYPES:
-                errors.append(f"{prefix}: scene_type 值无效 '{scene_type}'，必须是 {self.VALID_SCENE_TYPES}")
-
             duration = scene.get("duration_seconds")
             if duration is None:
                 warnings.append(f"{prefix}: 缺少 duration_seconds，将使用默认值 8")
-            elif duration not in self.VALID_DURATIONS:
-                errors.append(f"{prefix}: duration_seconds 值无效 '{duration}'，必须是 {self.VALID_DURATIONS}")
+            elif not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0:
+                errors.append(f"{prefix}: duration_seconds 值无效 '{duration}'，必须为正整数")
 
             chars_in_scene = scene.get("characters_in_scene")
             if chars_in_scene is None:
@@ -589,9 +620,12 @@ class DataValidator:
         if novel is not None and not isinstance(novel, dict):
             errors.append("novel 字段必须是对象")
 
-        if content_mode == "narration":
-            self._validate_segments(
-                episode.get("segments", []),
+        # "视频来源"维度由 generation_mode 表达；content_mode 只决定 narration vs
+        # drama 之间如何排布数据（segments vs scenes）。
+        is_reference = effective_mode(project=project, episode=episode) == "reference_video"
+        if is_reference:
+            self._validate_reference_video_script(
+                episode.get("video_units", []),
                 project_characters,
                 project_scenes,
                 project_props,
@@ -599,9 +633,9 @@ class DataValidator:
                 warnings,
                 project_dir=project_dir,
             )
-        elif content_mode == "reference_video":
-            self._validate_reference_video_script(
-                episode.get("video_units", []),
+        elif content_mode == "narration":
+            self._validate_segments(
+                episode.get("segments", []),
                 project_characters,
                 project_scenes,
                 project_props,

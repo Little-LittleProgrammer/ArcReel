@@ -21,6 +21,9 @@ class _FakeWorker:
     async def stop(self):
         pass
 
+    def request_cancel(self, _task_id: str) -> bool:
+        return False
+
 
 @pytest.mark.asyncio
 async def test_startup_invokes_project_migrations(monkeypatch):
@@ -35,6 +38,8 @@ async def test_startup_invokes_project_migrations(monkeypatch):
     monkeypatch.setattr(app_module, "create_generation_worker", _FakeWorker)
     monkeypatch.setattr(assistant_router.assistant_service, "startup", _noop_async)
     monkeypatch.setattr(assistant_router.assistant_service, "shutdown", _noop_async)
+    # Avoid touching real on-disk projects/ during a unit test that fires lifespan.
+    monkeypatch.setattr(app_module, "migrate_local_transcripts_to_store", _noop_async)
 
     app = app_module.app
     app.state = SimpleNamespace()

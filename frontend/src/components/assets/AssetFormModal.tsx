@@ -1,10 +1,13 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useId, useState, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, ImagePlus, Landmark, Package, User, X } from "lucide-react";
+import { AlertTriangle, ImagePlus, Landmark, Package, User } from "lucide-react";
 import type { Asset, AssetType } from "@/types/asset";
-import { useFocusTrap } from "@/hooks/useFocusTrap";
-import { useEscapeClose } from "@/hooks/useEscapeClose";
+import { GlassModal } from "@/components/ui/GlassModal";
+import { ModalCloseButton } from "@/components/ui/ModalCloseButton";
+import { PrimaryButton } from "@/components/ui/PrimaryButton";
+import { SecondaryButton } from "@/components/ui/SecondaryButton";
 import { sanitizeImageSrc } from "@/utils/safe-url";
+import { WARM_TONE } from "@/utils/severity-tone";
 
 type Mode = "create" | "edit" | "import";
 
@@ -42,17 +45,16 @@ export function AssetFormModal({
   const [submitting, setSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
-  useFocusTrap(dialogRef);
+  const titleId = useId();
 
   useEffect(() => {
     nameRef.current?.focus();
   }, []);
 
-  useEscapeClose(onClose);
-
   useEffect(() => {
     if (!image) {
+      // image 变更时同步重置本地预览（动作驱动重置）
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLocalPreview(null);
       return;
     }
@@ -83,45 +85,62 @@ export function AssetFormModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
-      <button
-        type="button"
-        aria-label={t("close")}
-        onClick={onClose}
-        className="absolute inset-0 bg-black/70 backdrop-blur-sm"
-      />
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        className="relative w-[560px] max-w-[96vw] overflow-hidden rounded-2xl border border-gray-700/80 bg-gray-900 shadow-2xl shadow-black/60"
-      >
-        {/* Header */}
-        <div className="relative flex items-start gap-3 border-b border-gray-800 bg-gradient-to-b from-gray-900 to-gray-950 px-6 py-5">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-indigo-500/30 bg-indigo-500/10 text-indigo-300">
+    <GlassModal
+      open
+      onClose={onClose}
+      labelledBy={titleId}
+      widthClassName="w-[580px] max-w-[96vw]"
+    >
+      {/* Header */}
+        <div
+          className="flex items-start gap-3 px-6 py-5"
+          style={{ borderBottom: "1px solid var(--color-hairline-soft)" }}
+        >
+          <span
+            aria-hidden
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-lg"
+            style={{
+              background:
+                "linear-gradient(135deg, var(--color-accent-dim), oklch(0.76 0.09 295 / 0.05))",
+              border: "1px solid var(--color-accent-soft)",
+              color: "var(--color-accent-2)",
+              boxShadow: "0 8px 18px -8px var(--color-accent-glow)",
+            }}
+          >
             <TypeIcon className="h-4 w-4" />
-          </div>
+          </span>
           <div className="min-w-0 flex-1">
-            <h3 className="truncate text-base font-semibold text-white">{title}</h3>
-            <p className="mt-0.5 text-xs text-gray-500">
+            <h3
+              id={titleId}
+              className="display-serif truncate text-[15px] font-semibold tracking-tight"
+              style={{ color: "var(--color-text)" }}
+            >
+              {title}
+            </h3>
+            <p
+              className="num mt-0.5 text-[10px] uppercase"
+              style={{
+                color: "var(--color-text-4)",
+                letterSpacing: "1.0px",
+              }}
+            >
               {mode === "import" ? t("library_subtitle") : typeLabel}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label={t("close")}
-            className="rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <ModalCloseButton onClick={onClose} />
         </div>
 
         {/* Conflict warning */}
         {conflictWith && (
-          <div className="flex items-start gap-2 border-b border-amber-500/20 bg-amber-500/10 px-6 py-3 text-xs text-amber-200">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+          <div
+            className="flex items-start gap-2 px-6 py-3 text-[12px]"
+            style={{
+              borderBottom: `1px solid ${WARM_TONE.ring}`,
+              background: WARM_TONE.soft,
+              color: WARM_TONE.color,
+            }}
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0" />
             <span>{t("conflict_warning", { name: conflictWith.name })}</span>
           </div>
         )}
@@ -133,27 +152,66 @@ export function AssetFormModal({
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
-              className="group relative aspect-[3/4] w-full overflow-hidden rounded-xl border border-dashed border-gray-700 bg-gray-950/60 transition-colors hover:border-indigo-500/60 focus-ring"
+              className="focus-ring group relative aspect-video w-full overflow-hidden rounded-xl transition-colors"
+              style={{
+                background: "oklch(0.16 0.010 265 / 0.6)",
+                border: "1px dashed var(--color-hairline)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = "var(--color-accent-soft)";
+                e.currentTarget.style.borderStyle = "dashed";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = "var(--color-hairline)";
+              }}
             >
               {displayedPreview ? (
                 <>
                   <img
                     src={displayedPreview}
                     alt=""
-                    className="absolute inset-0 h-full w-full object-cover"
+                    className="absolute inset-0 h-full w-full object-contain"
                   />
-                  <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/60 text-sm text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  <div
+                    className="absolute inset-0 flex items-center justify-center gap-2 text-[13px] opacity-0 transition-opacity group-hover:opacity-100"
+                    style={{
+                      background: "oklch(0 0 0 / 0.6)",
+                      color: "var(--color-text)",
+                    }}
+                  >
                     <ImagePlus className="h-4 w-4" />
                     {t("replace_image")}
                   </div>
                 </>
               ) : (
-                <div className="flex h-full w-full flex-col items-center justify-center gap-2 px-4 text-center text-gray-500 transition-colors group-hover:text-gray-300">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-800 text-gray-400">
+                <div
+                  className="flex h-full w-full flex-col items-center justify-center gap-2 px-4 text-center transition-colors"
+                  style={{ color: "var(--color-text-4)" }}
+                >
+                  <span
+                    aria-hidden
+                    className="grid h-10 w-10 place-items-center rounded-full"
+                    style={{
+                      background:
+                        "linear-gradient(135deg, var(--color-accent-dim), oklch(0.76 0.09 295 / 0.05))",
+                      border: "1px solid var(--color-accent-soft)",
+                      color: "var(--color-accent-2)",
+                    }}
+                  >
                     <ImagePlus className="h-4 w-4" />
-                  </div>
-                  <span className="text-xs">{t("upload_image_hint")}</span>
-                  <span className="text-[10px] text-gray-600">{t("upload_image_optional")}</span>
+                  </span>
+                  <span
+                    className="text-[12px]"
+                    style={{ color: "var(--color-text-3)" }}
+                  >
+                    {t("upload_image_hint")}
+                  </span>
+                  <span
+                    className="text-[10px]"
+                    style={{ color: "var(--color-text-4)" }}
+                  >
+                    {t("upload_image_optional")}
+                  </span>
                 </div>
               )}
             </button>
@@ -168,68 +226,111 @@ export function AssetFormModal({
 
           {/* Form fields */}
           <div className="flex flex-col gap-4">
-            <label className="flex flex-col gap-1.5 text-[11px] font-medium uppercase tracking-wider text-gray-500">
-              <span>
-                {t("field.name")} <span className="text-indigo-300">*</span>
-              </span>
+            <FieldLabel
+              label={
+                <>
+                  {t("field.name")}{" "}
+                  <span style={{ color: "var(--color-accent-2)" }}>*</span>
+                </>
+              }
+            >
               <input
                 ref={nameRef}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                className="rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 transition-colors placeholder:text-gray-600 focus:border-indigo-500/60 focus:outline-none"
+                className="focus-ring rounded-lg px-3 py-2 text-[13px] outline-none"
+                style={{
+                  background: "oklch(0.16 0.010 265 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                  color: "var(--color-text)",
+                }}
               />
-            </label>
-            <label className="flex flex-col gap-1.5 text-[11px] font-medium uppercase tracking-wider text-gray-500">
-              {t("field.description")}
+            </FieldLabel>
+
+            <FieldLabel label={t("field.description")}>
               <textarea
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 rows={4}
-                className="resize-none rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 leading-5 transition-colors focus:border-indigo-500/60 focus:outline-none"
+                className="focus-ring resize-none rounded-lg px-3 py-2 text-[13px] leading-[1.55] outline-none"
+                style={{
+                  background: "oklch(0.16 0.010 265 / 0.6)",
+                  border: "1px solid var(--color-hairline)",
+                  color: "var(--color-text)",
+                }}
               />
-            </label>
+            </FieldLabel>
+
             {isCharacter && (
-              <label className="flex flex-col gap-1.5 text-[11px] font-medium uppercase tracking-wider text-gray-500">
-                {t("field.voice_style")}
+              <FieldLabel label={t("field.voice_style")}>
                 <input
                   value={voiceStyle}
                   onChange={(e) => setVoiceStyle(e.target.value)}
-                  className="rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-100 transition-colors focus:border-indigo-500/60 focus:outline-none"
+                  className="focus-ring rounded-lg px-3 py-2 text-[13px] outline-none"
+                  style={{
+                    background: "oklch(0.16 0.010 265 / 0.6)",
+                    border: "1px solid var(--color-hairline)",
+                    color: "var(--color-text)",
+                  }}
                 />
-              </label>
+              </FieldLabel>
             )}
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex items-center gap-2 border-t border-gray-800 bg-gray-950/80 px-6 py-4">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg border border-gray-800 px-4 py-1.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:text-white"
-          >
+        <div
+          className="flex items-center gap-2 px-6 py-4"
+          style={{
+            borderTop: "1px solid var(--color-hairline-soft)",
+            background: "oklch(0.17 0.010 250 / 0.5)",
+          }}
+        >
+          <SecondaryButton size="sm" onClick={onClose}>
             {t("cancel")}
-          </button>
+          </SecondaryButton>
           {mode === "import" && conflictWith && (
-            <button
-              type="button"
+            <PrimaryButton
+              size="sm"
+              tone="warm"
               onClick={() => void submit(true)}
               disabled={submitting}
-              className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-1.5 text-sm text-amber-200 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
             >
               {t("overwrite_existing")}
-            </button>
+            </PrimaryButton>
           )}
-          <button
-            type="button"
+          <PrimaryButton
+            size="sm"
+            className="ml-auto"
             onClick={() => void submit(false)}
             disabled={submitting || !name.trim()}
-            className="ml-auto rounded-lg bg-indigo-600 px-5 py-1.5 text-sm font-medium text-white shadow-lg shadow-indigo-900/40 transition-all hover:bg-indigo-500 hover:shadow-indigo-700/50 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {primaryLabel}
-          </button>
+          </PrimaryButton>
         </div>
-      </div>
-    </div>
+    </GlassModal>
+  );
+}
+
+function FieldLabel({
+  label,
+  children,
+}: {
+  label: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span
+        className="num text-[10px] uppercase"
+        style={{
+          color: "var(--color-text-4)",
+          letterSpacing: "1.0px",
+        }}
+      >
+        {label}
+      </span>
+      {children}
+    </label>
   );
 }

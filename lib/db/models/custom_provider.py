@@ -15,7 +15,7 @@ class CustomProvider(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    api_format: Mapped[str] = mapped_column(String(32), nullable=False)  # "openai" | "google" | "newapi"
+    discovery_format: Mapped[str] = mapped_column(String(32), nullable=False)  # "openai" | "google"
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
     api_key: Mapped[str] = mapped_column(Text, nullable=False)  # sensitive, masked in API responses
 
@@ -41,7 +41,7 @@ class CustomProviderModel(TimestampMixin, Base):
     )
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    media_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "text" | "image" | "video"
+    endpoint: Mapped[str] = mapped_column(String(32), nullable=False)  # ENDPOINT_REGISTRY key
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     price_unit: Mapped[str | None] = mapped_column(String(16), nullable=True)  # "token" | "image" | "second"
@@ -49,3 +49,6 @@ class CustomProviderModel(TimestampMixin, Base):
     price_output: Mapped[float | None] = mapped_column(Float, nullable=True)  # only for text
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "USD" | "CNY"
     supported_durations: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list[int]
+    resolution: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )  # standard token ("1080p"/"2K") or native "WxH"

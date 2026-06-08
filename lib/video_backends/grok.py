@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from lib.grok_shared import create_grok_client, grok_should_retry
+from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GROK
 from lib.retry import with_retry_async
 from lib.video_backends.base import (
@@ -57,6 +58,10 @@ class GrokVideoBackend:
     def video_capabilities(self) -> VideoCapabilities:
         return VideoCapabilities(reference_images=True, max_reference_images=7)
 
+    async def resume_video(self, job_id: str, request: VideoGenerationRequest) -> VideoGenerationResult:
+        # Grok 同步型 API，无 job_id 可接续；orphan handler 据 NotImplementedError 标 [resume_unsupported]
+        raise NotImplementedError("GrokVideoBackend 不支持 resume_video（同步型 API）")
+
     async def generate(self, request: VideoGenerationRequest) -> VideoGenerationResult:
         """生成视频。生成与下载分离重试，避免下载失败导致重新生成浪费额度。"""
         response = await self._create_video(request)
@@ -84,10 +89,11 @@ class GrokVideoBackend:
             "model": self._model,
             "duration": request.duration_seconds,
             "aspect_ratio": request.aspect_ratio,
-            "resolution": request.resolution,
             "timeout": timedelta(minutes=15),
             "interval": timedelta(seconds=5),
         }
+        if request.resolution is not None:
+            generate_kwargs["resolution"] = request.resolution
 
         def _encode_to_data_uri(path: Path) -> str:
             suffix = path.suffix.lower()
@@ -107,4 +113,5 @@ class GrokVideoBackend:
                 generate_kwargs["reference_image_urls"] = list(ref_urls)
 
         logger.info("Grok 视频生成开始: model=%s, duration=%ds", self._model, request.duration_seconds)
+        logger.info("调用 %s 视频 SDK kwargs=%s", self.name, format_kwargs_for_log(generate_kwargs))
         return await self._client.video.generate(**generate_kwargs)

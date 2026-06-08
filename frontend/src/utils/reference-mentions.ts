@@ -3,15 +3,33 @@ import type { AssetKind, ReferenceResource } from "@/types/reference-video";
 
 /**
  * Mention regex shared across frontend tokenizers. Mirrors backend
- * `lib/reference_video/shot_parser.py:_MENTION_RE` — keep in sync.
+ * `lib/reference_video/shot_parser.py` mention scanner — keep in sync.
+ *
+ * 前后端字面不同但语义等价：
+ * - JS `\w` 永远是 ASCII-only，`(?<!\w)` 直接表达"左侧不是 ASCII 词字符"。
+ * - Python `\w` 默认 Unicode-aware（中文属 `\w`），所以后端改用显式
+ *   `[A-Za-z0-9_]` 字符类，避免误拒 `你好@张三` 这类中文前缀。
+ *
+ * CJK 字符（`\u4e00-\u9fff`）在两边都不在词字符集内，所以中文前缀合法。
+ *
+ * Supports legacy `@名称` plus wrapped `@[名称]` for asset names
+ * containing punctuation, spaces, or parentheses.
+ *
+ * Curly-brace wrapping (`@{名称}`) is intentionally unsupported: the editor
+ * only emits `@[名称]`, and narrowing the parser avoids carrying an unused
+ * alternate syntax through highlight / merge / backend replacement paths.
  */
-export const MENTION_RE = /@([\w\u4e00-\u9fff]+)/g;
+export const MENTION_RE = /(?<!\w)@(?:\[([^\]\r\n]+)\]|([\w\u4e00-\u9fff]+))/g;
+
+export function mentionNameFromMatch(match: RegExpMatchArray): string {
+  return match[1] ?? match[2] ?? "";
+}
 
 export function extractMentions(text: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const m of text.matchAll(MENTION_RE)) {
-    const name = m[1];
+    const name = mentionNameFromMatch(m);
     if (!seen.has(name)) {
       seen.add(name);
       out.push(name);

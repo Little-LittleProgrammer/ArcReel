@@ -4,9 +4,8 @@ import { ChevronDown } from "lucide-react";
 import { AutoTextarea } from "@/components/ui/AutoTextarea";
 import { CompactInput } from "@/components/ui/CompactInput";
 import { DropdownPill } from "@/components/ui/DropdownPill";
-import { DialogueListEditor } from "./DialogueListEditor";
-import { CAMERA_MOTIONS } from "@/types";
-import type { VideoPrompt, CameraMotion, Dialogue } from "@/types";
+import { CAMERA_MOTIONS, CAMERA_MOTION_I18N_KEYS } from "@/types";
+import type { VideoPrompt, CameraMotion } from "@/types";
 
 interface VideoPromptEditorProps {
   prompt: VideoPrompt;
@@ -47,6 +46,7 @@ export function VideoPromptEditor({
             label={t("camera_motion_label")}
             value={prompt.camera_motion}
             options={CAMERA_MOTIONS}
+            renderOption={(v: CameraMotion) => t(CAMERA_MOTION_I18N_KEYS[v])}
             onChange={(v: CameraMotion) => onUpdate({ camera_motion: v })}
           />
           <CompactInput
@@ -54,10 +54,6 @@ export function VideoPromptEditor({
             value={prompt.ambiance_audio}
             onChange={(v) => onUpdate({ ambiance_audio: v })}
             placeholder={t("ambiance_audio_placeholder")}
-          />
-          <DialogueListEditor
-            dialogue={prompt.dialogue ?? []}
-            onChange={(d: Dialogue[]) => onUpdate({ dialogue: d })}
           />
         </div>
       )}

@@ -117,10 +117,15 @@ class TestSessionManagerMore:
 
     @pytest.mark.asyncio
     async def test_build_options_and_connect_paths(self, session_manager, meta_store, tmp_path, monkeypatch):
+        async def _fake_env(_self):
+            return {}
+
+        monkeypatch.setattr(sm_mod.SessionManager, "_build_provider_env_overrides", _fake_env)
+
         with monkeypatch.context() as m:
             m.setattr(sm_mod, "SDK_AVAILABLE", False)
             with pytest.raises(RuntimeError):
-                session_manager._build_options("demo")
+                await session_manager._build_options("demo")
 
         projects_demo = tmp_path / "projects" / "demo"
         projects_demo.mkdir(parents=True)
@@ -327,9 +332,11 @@ class TestSessionManagerMore:
         managed.message_buffer.append({"type": "assistant", "uuid": "a1"})
         session_manager.sessions[meta.id] = managed
 
-        queue = await session_manager.subscribe(meta.id, replay_buffer=True)
-        assert queue.get_nowait()["uuid"] == "a1"
-        await session_manager.unsubscribe(meta.id, queue)
+        queue, replay = await session_manager._subscribe(meta.id, replay=True)
+        # 回放作为快照单独返回，不再塞进直播队列。
+        assert replay[0]["uuid"] == "a1"
+        assert queue.empty()
+        await session_manager._unsubscribe(meta.id, queue)
         assert queue not in managed.subscribers
 
         await session_manager.shutdown_gracefully(timeout=0.01)
@@ -337,8 +344,88 @@ class TestSessionManagerMore:
         assert session_manager.sessions == {}
 
     @pytest.mark.asyncio
+    async def test_stream_messages_replay_boundary_live_and_idle(self, session_manager, meta_store):
+        from tests.fakes import build_managed_with_actor
+
+        meta = await meta_store.create("demo", "sdk-stream-seq")
+        managed, _actor, _client = await build_managed_with_actor(
+            session_id=meta.id,
+            project_name="demo",
+            status="running",
+        )
+        managed.message_buffer.append({"type": "assistant", "uuid": "replay-1"})
+        session_manager.sessions[meta.id] = managed
+
+        async with session_manager.stream_messages(meta.id, replay=True, idle_timeout=0.05) as stream:
+            assert (await anext(stream))["uuid"] == "replay-1"
+            assert (await anext(stream))["type"] == "_replay_done"
+            managed.add_message({"type": "assistant", "uuid": "live-1"})
+            assert (await anext(stream))["uuid"] == "live-1"
+            # idle_timeout 内无消息 → _idle 哨兵
+            assert (await anext(stream))["type"] == "_idle"
+        # 正常退出后订阅者被移除
+        assert managed.subscribers == set()
+
+    @pytest.mark.asyncio
+    async def test_stream_messages_overflow_ends_iteration(self, session_manager, meta_store):
+        from tests.fakes import build_managed_with_actor
+
+        meta = await meta_store.create("demo", "sdk-stream-overflow")
+        managed, _actor, _client = await build_managed_with_actor(
+            session_id=meta.id,
+            project_name="demo",
+            status="running",
+        )
+        session_manager.sessions[meta.id] = managed
+
+        async with session_manager.stream_messages(meta.id, replay=False, idle_timeout=5.0) as stream:
+            assert (await anext(stream))["type"] == "_replay_done"
+            # 挤爆订阅者队列：critical 消息填满 + 无可驱逐 → 注入 _queue_overflow。
+            for i in range(120):
+                managed.add_message({"type": "assistant", "uuid": f"m{i}"})
+            saw_overflow = False
+            async for msg in stream:
+                if msg.get("type") == "_queue_overflow":
+                    saw_overflow = True
+                    break
+            assert saw_overflow
+        assert managed.subscribers == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exit_mode", ["break", "exception"])
+    async def test_stream_messages_unsubscribes_on_every_exit(self, session_manager, meta_store, exit_mode):
+        from tests.fakes import build_managed_with_actor
+
+        meta = await meta_store.create("demo", f"sdk-exit-{exit_mode}")
+        managed, _actor, _client = await build_managed_with_actor(
+            session_id=meta.id,
+            project_name="demo",
+            status="running",
+        )
+        session_manager.sessions[meta.id] = managed
+
+        async def consume():
+            async with session_manager.stream_messages(meta.id, replay=False, idle_timeout=0.02) as stream:
+                assert len(managed.subscribers) == 1
+                async for msg in stream:
+                    if msg.get("type") == "_replay_done":
+                        continue
+                    if exit_mode == "exception":
+                        raise RuntimeError("boom")
+                    break  # break 退出路径
+
+        if exit_mode == "exception":
+            with pytest.raises(RuntimeError):
+                await consume()
+        else:
+            await consume()
+        # break / 异常退出路径同样确定性移除订阅者
+        assert managed.subscribers == set()
+
+    @pytest.mark.asyncio
     async def test_file_access_hook_allows_read_within_project_root(self, tmp_path):
-        """Hook allows Read for any path within project_root (e.g. other projects, docs)."""
+        """Hook allows Read within cwd and cwd-external (non-projects) paths;
+        cross-project read is denied per new sandbox policy."""
         own_project = tmp_path / "projects" / "alpha"
         own_project.mkdir(parents=True)
         other_project = tmp_path / "projects" / "beta"
@@ -368,29 +455,21 @@ class TestSessionManagerMore:
         )
         assert result.get("continue_") is True
 
-        # Read other project file — allowed (within project_root)
+        # Read other project file — denied (跨项目隔离)
         result = await hook(
             {"tool_name": "Read", "tool_input": {"file_path": str(other_project / "script.json")}},
             None,
             None,
         )
-        assert result.get("continue_") is True
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-        # Read docs dir — allowed (within project_root)
+        # Read docs dir — allowed (cwd 外且不在 projects/ 下，作为参考资料)
         result = await hook(
             {"tool_name": "Read", "tool_input": {"file_path": str(docs_dir / "guide.md")}},
             None,
             None,
         )
         assert result.get("continue_") is True
-
-        # Read outside project_root — denied
-        result = await hook(
-            {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}},
-            None,
-            None,
-        )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
         await engine.dispose()
 
@@ -466,7 +545,11 @@ class TestSessionManagerMore:
 
     @pytest.mark.asyncio
     async def test_file_access_hook_blocks_write_non_whitelisted_ext(self, tmp_path):
-        """Hook denies Write/Edit for non-whitelisted file extensions in project dir."""
+        """Hook denies Write/Edit for forbidden code extensions in project dir.
+
+        New policy: blacklist of code extensions (.py/.js/.ts/.tsx/.sh/.yaml/.yml/.toml)
+        instead of data-file whitelist; non-code files (Makefile, .html, .csv) allowed.
+        """
         own_project = tmp_path / "projects" / "alpha"
         own_project.mkdir(parents=True)
 
@@ -484,16 +567,16 @@ class TestSessionManagerMore:
 
         hook = mgr._build_file_access_hook(own_project)
 
-        # Write .py in project dir — denied
+        # Write .py in project dir — denied (code extension)
         result = await hook(
             {"tool_name": "Write", "tool_input": {"file_path": str(own_project / "helper.py")}},
             None,
             None,
         )
         assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert ".json" in result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert ".py" in result["hookSpecificOutput"]["permissionDecisionReason"]
 
-        # Edit .sh in project dir — denied
+        # Edit .sh in project dir — denied (code extension)
         result = await hook(
             {"tool_name": "Edit", "tool_input": {"file_path": str(own_project / "run.sh")}},
             None,
@@ -501,9 +584,9 @@ class TestSessionManagerMore:
         )
         assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-        # Write .json — allowed
+        # Write 普通 .json — allowed（project.json / scripts/*.json 另由专门 deny 覆盖）
         result = await hook(
-            {"tool_name": "Write", "tool_input": {"file_path": str(own_project / "project.json")}},
+            {"tool_name": "Write", "tool_input": {"file_path": str(own_project / "notes.json")}},
             None,
             None,
         )
@@ -533,13 +616,13 @@ class TestSessionManagerMore:
         )
         assert result.get("continue_") is True
 
-        # Write file without extension (e.g. Makefile) — denied
+        # Write file without extension (e.g. Makefile) — allowed (not in code blacklist)
         result = await hook(
             {"tool_name": "Write", "tool_input": {"file_path": str(own_project / "Makefile")}},
             None,
             None,
         )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert result.get("continue_") is True
 
         # Write .JSON (uppercase) — allowed (case-insensitive check)
         result = await hook(
@@ -557,7 +640,9 @@ class TestSessionManagerMore:
         own_project = tmp_path / "projects" / "alpha"
         own_project.mkdir(parents=True)
         profile_md = tmp_path / "agent_runtime_profile" / "CLAUDE.md"
-        profile_md.parent.mkdir(parents=True)
+        # conftest 的 _profile_env autouse fixture 已预创建 profile dir，
+        # 这里用 exist_ok=True 容忍。CLAUDE.md 内容会被本测试覆写为有意义文本。
+        profile_md.parent.mkdir(parents=True, exist_ok=True)
         profile_md.write_text("# Agent instructions")
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -611,7 +696,11 @@ class TestSessionManagerMore:
 
     @pytest.mark.asyncio
     async def test_file_access_hook_allows_read_sdk_tool_results(self, tmp_path, monkeypatch):
-        """Hook allows Read for SDK tool-results of the CURRENT project only."""
+        """Hook allows Read for SDK tool-results of the CURRENT project.
+
+        New policy: cwd-external non-projects paths (含 SDK 目录) 默认放行；
+        Write 仍受 cwd 内限制约束。
+        """
         hook, own_project, claude_home, engine = await self._make_sdk_hook_env(
             tmp_path,
             monkeypatch,
@@ -631,16 +720,6 @@ class TestSessionManagerMore:
         )
         assert result.get("continue_") is True
 
-        # Read own project's SDK session transcript (NOT tool-results) — denied
-        transcript = claude_home / encoded / "abc-session" / "transcript.jsonl"
-        transcript.write_text("{}")
-        result = await hook(
-            {"tool_name": "Read", "tool_input": {"file_path": str(transcript)}},
-            None,
-            None,
-        )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-
         # Write to SDK tool-results — still denied (write tools only allow project_cwd)
         result = await hook(
             {"tool_name": "Write", "tool_input": {"file_path": str(result_file)}},
@@ -652,22 +731,23 @@ class TestSessionManagerMore:
         await engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_file_access_hook_denies_read_other_project_sdk_data(self, tmp_path, monkeypatch):
-        """Hook denies Read for ANOTHER project's SDK session data."""
-        hook, _, claude_home, engine = await self._make_sdk_hook_env(
+    async def test_file_access_hook_denies_read_other_project_dir(self, tmp_path, monkeypatch):
+        """Hook denies Read for ANOTHER project's directory under projects/.
+
+        New policy: 跨项目隔离基于 project_root/projects/<other>/ 的物理位置，
+        而非 SDK 编码路径。
+        """
+        hook, _, _, engine = await self._make_sdk_hook_env(
             tmp_path,
             monkeypatch,
         )
 
         other_project = tmp_path / "app" / "projects" / "beta"
         other_project.mkdir(parents=True)
-        other_encoded = sm_mod.SessionManager._encode_sdk_project_path(other_project)
-        other_tool_results = claude_home / other_encoded / "xyz-session" / "tool-results"
-        other_tool_results.mkdir(parents=True)
-        other_file = other_tool_results / "toolu_other.txt"
-        other_file.write_text("other project output")
+        other_file = other_project / "secret.json"
+        other_file.write_text("{}")
 
-        # Read OTHER project's SDK data — denied (cross-project isolation)
+        # Read OTHER project directly — denied (cross-project isolation)
         result = await hook(
             {"tool_name": "Read", "tool_input": {"file_path": str(other_file)}},
             None,
@@ -678,13 +758,16 @@ class TestSessionManagerMore:
         await engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_file_access_hook_denies_read_outside_all_allowed_paths(self, tmp_path, monkeypatch):
-        """Hook denies Read for paths outside project_root AND SDK directory."""
+    async def test_file_access_hook_denies_write_outside_cwd(self, tmp_path, monkeypatch):
+        """Hook denies Write to any path outside project_cwd.
+
+        New policy: 写工具一律拒绝 cwd 外路径；Read 已放宽至 cwd 外非 projects/ 路径。
+        """
         hook, _, _, engine = await self._make_sdk_hook_env(tmp_path, monkeypatch)
 
-        # Path completely outside all allowed zones
+        # Write outside cwd — denied
         result = await hook(
-            {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}},
+            {"tool_name": "Write", "tool_input": {"file_path": "/tmp/escape.json"}},
             None,
             None,
         )
@@ -694,7 +777,11 @@ class TestSessionManagerMore:
 
     @pytest.mark.asyncio
     async def test_file_access_hook_allows_read_sdk_task_output(self, tmp_path, monkeypatch):
-        """Hook allows Read for SDK task output files under /tmp/claude-*."""
+        """Hook allows Read for SDK task output files under /tmp/claude-*.
+
+        New policy: cwd-external non-projects 路径默认放行（含 SDK 后台任务输出），
+        写工具仍受 cwd 内限制约束。
+        """
         hook, _, _, engine = await self._make_sdk_hook_env(tmp_path, monkeypatch)
 
         # SDK task output path pattern: /tmp/claude-{N}/{encoded}/tasks/{id}.output
@@ -709,15 +796,6 @@ class TestSessionManagerMore:
         # Write to task output — denied (write tools only allow project_cwd)
         result = await hook(
             {"tool_name": "Write", "tool_input": {"file_path": task_output}},
-            None,
-            None,
-        )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-
-        # /tmp/claude-* path WITHOUT tasks/ segment — denied
-        non_task_path = "/tmp/claude-0/-app-projects-alpha/sessions/abc.jsonl"
-        result = await hook(
-            {"tool_name": "Read", "tool_input": {"file_path": non_task_path}},
             None,
             None,
         )

@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import json as json_module
 import logging
-import os
 from pathlib import Path
 
 from PIL import Image
 
 from lib.config.url_utils import normalize_base_url
-from lib.gemini_shared import VERTEX_SCOPES, RateLimiter, get_shared_rate_limiter, with_retry_async
+from lib.gemini_shared import (
+    VERTEX_SCOPES,
+    RateLimiter,
+    get_shared_rate_limiter,
+    resolve_gemini_api_key,
+    with_retry_async,
+)
 from lib.image_backends.base import (
     ImageCapability,
     ImageGenerationRequest,
     ImageGenerationResult,
     ReferenceImage,
 )
+from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GEMINI
 from lib.system_config import resolve_vertex_credentials_path
 
@@ -48,7 +54,7 @@ class GeminiImageBackend:
         self._types = _types
         self._rate_limiter = rate_limiter or get_shared_rate_limiter()
         self._backend_type = backend_type.strip().lower()
-        self._image_model = image_model or os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_IMAGE_MODEL)
+        self._image_model = image_model or DEFAULT_IMAGE_MODEL
 
         if self._backend_type == "vertex":
             from google.oauth2 import service_account
@@ -57,12 +63,12 @@ class GeminiImageBackend:
             if credentials_path:
                 credentials_file = Path(credentials_path)
             else:
-                credentials_file = resolve_vertex_credentials_path(Path(__file__).parent.parent.parent)
+                credentials_file = resolve_vertex_credentials_path()
 
             if credentials_file is None:
                 raise ValueError("未找到 Vertex AI 凭证文件")
 
-            with open(credentials_file) as f:
+            with open(credentials_file, encoding="utf-8") as f:
                 creds_data = json_module.load(f)
             project_id = creds_data.get("project_id")
 
@@ -77,13 +83,10 @@ class GeminiImageBackend:
                 credentials=credentials,
             )
         else:
-            _api_key = api_key or os.environ.get("GEMINI_API_KEY")
-            if not _api_key:
-                raise ValueError("Gemini API Key 未提供。请在「全局设置 → 供应商」页面配置 API Key。")
-
-            effective_base_url = normalize_base_url(base_url or os.environ.get("GEMINI_BASE_URL"))
+            api_key = resolve_gemini_api_key(api_key)
+            effective_base_url = normalize_base_url(base_url)
             http_options = {"base_url": effective_base_url} if effective_base_url else None
-            self._client = _genai.Client(api_key=_api_key, http_options=http_options)
+            self._client = _genai.Client(api_key=api_key, http_options=http_options)  # type: ignore[arg-type]
 
         self._capabilities: set[ImageCapability] = {
             ImageCapability.TEXT_TO_IMAGE,
@@ -112,16 +115,23 @@ class GeminiImageBackend:
         # 2. 构建 contents（参考图 + prompt）
         contents = self._build_contents_with_labeled_refs(request.prompt, request.reference_images)
 
-        # 3. 构建配置
+        image_config_kwargs: dict = {"aspect_ratio": request.aspect_ratio}
+        if request.image_size is not None:
+            image_config_kwargs["image_size"] = request.image_size
+
         config = self._types.GenerateContentConfig(
             response_modalities=["IMAGE"],
-            image_config=self._types.ImageConfig(
-                aspect_ratio=request.aspect_ratio,
-                image_size=request.image_size,
-            ),
+            image_config=self._types.ImageConfig(**image_config_kwargs),
         )
 
         # 4. 调用异步 API
+        logger.info(
+            "调用 %s 图片 SDK payload=%s",
+            self.name,
+            format_kwargs_for_log(
+                {"model": self._image_model, "contents": contents, "image_config": image_config_kwargs}
+            ),
+        )
         response = await self._client.aio.models.generate_content(
             model=self._image_model, contents=contents, config=config
         )

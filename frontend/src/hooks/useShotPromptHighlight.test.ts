@@ -4,8 +4,12 @@ import { tokenizePrompt, type MentionLookup, type Token } from "./useShotPromptH
 const LOOKUP: MentionLookup = {
   主角: "character",
   张三: "character",
+  "角色甲（成年）": "character",
+  角色乙: "character",
   酒馆: "scene",
+  地点甲·版本A: "scene",
   长剑: "prop",
+  载具甲: "prop",
 };
 
 function kinds(tokens: Token[]): string[] {
@@ -42,6 +46,33 @@ describe("tokenizePrompt", () => {
     expect(mention?.text).toBe("@路人");
   });
 
+  it("resolves wrapped mentions with punctuation", () => {
+    const t = tokenizePrompt(
+      "Shot 1 (8s): @[角色甲（成年）]引导@[角色乙]靠近@[载具甲]区域，移动到@[地点甲·版本A]",
+      LOOKUP,
+    );
+    const mentions = t.filter((x) => x.kind === "mention");
+    expect(mentions.map((x) => (x.kind === "mention" ? x.name : ""))).toEqual([
+      "角色甲（成年）",
+      "角色乙",
+      "载具甲",
+      "地点甲·版本A",
+    ]);
+    expect(kinds(t).filter((kind) => kind.startsWith("mention:"))).toEqual([
+      "mention:character",
+      "mention:character",
+      "mention:prop",
+      "mention:scene",
+    ]);
+  });
+
+  it("treats curly-brace wrapped text as plain text", () => {
+    const t = tokenizePrompt("Shot 1 (3s): @{载具甲} 靠近 @[角色甲（成年）]", LOOKUP);
+    const mentions = t.filter((x) => x.kind === "mention");
+    expect(mentions.map((x) => (x.kind === "mention" ? x.name : ""))).toEqual(["角色甲（成年）"]);
+    expect(t.some((x) => x.kind === "text" && x.text.includes("@{载具甲}"))).toBe(true);
+  });
+
   it("handles multi-line with multiple shot headers", () => {
     const t = tokenizePrompt(
       "Shot 1 (3s): line1\nShot 2 (5s): line2 @主角",
@@ -64,11 +95,11 @@ describe("tokenizePrompt", () => {
     expect(only.map((x) => x.text).join("")).toBe("   ");
   });
 
-  it("does not treat '@' without a following word char as a mention", () => {
+  it("rejects '@' following a word character (mirrors backend MENTION_RE boundary)", () => {
+    // `price@5`: `e` 是 \w 前缀 → `@5` 不算 mention
+    // `email a@b`: `a` 是 \w 前缀 → `@b` 不算 mention
     const t = tokenizePrompt("price@5, email a@b", LOOKUP);
-    // @5 has a digit (\w) so IS a mention (unknown); @b is a mention (unknown).
-    // This mirrors the backend regex behaviour intentionally.
     const mentions = t.filter((x) => x.kind === "mention");
-    expect(mentions.length).toBeGreaterThanOrEqual(1);
+    expect(mentions).toHaveLength(0);
   });
 });

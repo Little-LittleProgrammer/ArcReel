@@ -48,6 +48,18 @@ def test_extract_mentions_ordered_unique():
     assert refs == ["张三", "酒馆", "长剑"]
 
 
+def test_extract_mentions_supports_wrapped_names():
+    text = "Shot 1 (8s): @[角色甲（成年）] 引导@[角色乙]靠近@[载具甲]区域，使用@[道具甲]完成动作"
+    _shots, refs, _ = parse_prompt(text)
+    assert refs == ["角色甲（成年）", "角色乙", "载具甲", "道具甲"]
+
+
+def test_extract_mentions_supports_punctuation_in_wrapped_scene_name():
+    text = "Shot 1 (8s): @[载具甲]移动到@[地点甲·版本A]"
+    _shots, refs, _ = parse_prompt(text)
+    assert refs == ["载具甲", "地点甲·版本A"]
+
+
 def test_extract_mentions_empty_prompt():
     _shots, refs, _ = parse_prompt("没有任何提及")
     assert refs == []
@@ -62,6 +74,30 @@ def test_render_prompt_replaces_mentions():
     ]
     rendered = render_prompt_for_backend(text, refs)
     assert rendered == "中景，[图1] 走进 [图2] 找 [图3]。"
+
+
+def test_render_prompt_replaces_wrapped_mentions_without_spacing():
+    text = "@[角色甲（成年）]引导@[角色乙]靠近@[载具甲]区域，使用@[道具甲]完成动作。"
+    refs = [
+        ReferenceResource(type="character", name="角色甲（成年）"),
+        ReferenceResource(type="character", name="角色乙"),
+        ReferenceResource(type="prop", name="载具甲"),
+        ReferenceResource(type="prop", name="道具甲"),
+    ]
+    rendered = render_prompt_for_backend(text, refs)
+    assert rendered == "[图1]引导[图2]靠近[图3]区域，使用[图4]完成动作。"
+
+
+def test_extract_mentions_rejects_non_ascii_legacy_letters():
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("@éclair @한글 @张三 @abc_123") == ["张三", "abc_123"]
+
+
+def test_extract_mentions_rejects_curly_wrapped_form():
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("@[角色甲（成年）] 与 @{道具甲}") == ["角色甲（成年）"]
 
 
 def test_render_prompt_unknown_mention_kept():
@@ -150,3 +186,42 @@ def test_parse_multi_shot_preserves_pre_header_text():
     assert "中远景" in shots[0].text
     # 第二个 shot 不受影响
     assert shots[1].text == "近景，对面的张三抬眼。"
+
+
+# ── mention 前缀边界 ────────────────────────────────────────
+
+
+def test_mention_ignores_email_like_prefix():
+    """email 左侧是 \\w，不应被当成 mention。"""
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("contact a@张三 for help") == []
+    assert _extract_mentions("email: test@domain.com") == []
+    assert _extract_mentions("alice@example.com 和 bob@foo.io") == []
+    assert _extract_mentions("room9@张三") == []
+    assert _extract_mentions("user123@李四") == []
+
+
+def test_mention_accepts_chinese_prefix():
+    """中文左侧字符（\\u4e00-\\u9fff）不是 \\w，合法 mention 用法。"""
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("你好@张三") == ["张三"]
+    assert _extract_mentions("（对面）@李四 抬眼") == ["李四"]
+
+
+def test_mention_accepts_whitespace_and_line_start():
+    """空白字符 / 行首 / 标点前缀都应识别。"""
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("@张三") == ["张三"]
+    assert _extract_mentions("之后 @张三 回头") == ["张三"]
+    assert _extract_mentions("Shot 1 (3s):\n@张三 开门") == ["张三"]
+    assert _extract_mentions("台词：@张三 起身") == ["张三"]
+
+
+def test_mention_underscore_prefix_is_rejected():
+    """underscore 属 \\w，`foo_@张三` 类打字错误不应触发 mention。"""
+    from lib.reference_video.shot_parser import _extract_mentions
+
+    assert _extract_mentions("prefix_@张三") == []

@@ -1,24 +1,101 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { MentionPicker, type MentionCandidate } from "./MentionPicker";
+import { MENTION_PICKER_DEFAULT_ID, MentionPicker, type MentionCandidate } from "./MentionPicker";
 import { ASSET_COLORS, assetColor } from "./asset-colors";
-import { useShotPromptHighlight, type MentionLookup } from "@/hooks/useShotPromptHighlight";
-import { mergeReferences } from "@/utils/reference-mentions";
+import { useShotPromptHighlight, type MentionLookup, type Token } from "@/hooks/useShotPromptHighlight";
+import { MENTION_RE } from "@/utils/reference-mentions";
 import { useProjectsStore } from "@/stores/projects-store";
-import type { AssetKind, ReferenceResource, ReferenceVideoUnit } from "@/types/reference-video";
+import {
+  SHEET_FIELD,
+  type AssetKind,
+  type ReferenceVideoUnit,
+} from "@/types/reference-video";
+
+// mention 胶囊改用 inline box-shadow 伪描边 + 背景色，不额外占宽：以前用 `px-0.5`
+// 每遇到一个 mention 视觉层比 textarea 字符宽度多 4px，导致光标定位与可见字符偏移。
+// 该类只应用颜色/背景/圆角，不改变盒模型宽度。
+const MENTION_SPAN_CLASS = "rounded-sm";
+
+/**
+ * 渲染 pre 层的 token span 串；当 caretOffset 命中某个 token 内部或边界时，在该位置
+ * 切一刀并插入一个零尺寸 caret anchor（给 picker 定位用）。
+ *
+ * anchor 只在 pickerOpen 下被使用（调用方传 null 时跳过插入）。为避免 anchor 的
+ * inline-block 影响行内 layout，用 `w-0 h-[1em] inline-block align-baseline`。
+ *
+ * anchor 元素通过 callback ref 回传给调用方，再交给 floating-ui 做 portal 定位。
+ */
+function renderHighlightedTokens(
+  tokens: Token[],
+  caretOffset: number | null,
+  setAnchorEl: (el: HTMLSpanElement | null) => void,
+): ReactNode {
+  const out: ReactNode[] = [];
+  let acc = 0;
+  const anchorEl = caretOffset !== null ? (
+    <span
+      key="__caret_anchor__"
+      ref={setAnchorEl}
+      aria-hidden="true"
+      className="inline-block h-[1em] w-0 align-baseline"
+    />
+  ) : null;
+
+  const renderPiece = (tk: Token, sliceText: string, key: string): ReactNode => {
+    if (sliceText.length === 0) return null;
+    if (tk.kind === "shot_header") {
+      return <span key={key} className="font-semibold text-indigo-300">{sliceText}</span>;
+    }
+    if (tk.kind === "mention") {
+      const palette = assetColor(tk.assetKind);
+      return (
+        <span key={key} className={`${MENTION_SPAN_CLASS} ${palette.textClass} ${palette.bgClass}`}>
+          {sliceText}
+        </span>
+      );
+    }
+    return <span key={key}>{sliceText}</span>;
+  };
+
+  let inserted = false;
+  tokens.forEach((tk, i) => {
+    const nextAcc = acc + tk.text.length;
+    if (!inserted && caretOffset !== null && caretOffset >= acc && caretOffset <= nextAcc) {
+      const local = caretOffset - acc;
+      out.push(<Fragment key={`pre-${i}`}>{renderPiece(tk, tk.text.slice(0, local), `pre-${i}`)}</Fragment>);
+      if (anchorEl) out.push(anchorEl);
+      out.push(<Fragment key={`post-${i}`}>{renderPiece(tk, tk.text.slice(local), `post-${i}`)}</Fragment>);
+      inserted = true;
+    } else {
+      out.push(<Fragment key={`t-${i}`}>{renderPiece(tk, tk.text, `t-${i}`)}</Fragment>);
+    }
+    acc = nextAcc;
+  });
+  if (!inserted && anchorEl && caretOffset !== null && caretOffset >= acc) {
+    out.push(anchorEl);
+  }
+  return out;
+}
 
 export interface ReferenceVideoCardProps {
   unit: ReferenceVideoUnit;
   projectName: string;
   episode: number;
-  onChangePrompt: (prompt: string, references: ReferenceResource[]) => void;
+  /** Controlled value — parent owns the draft/saved state. */
+  value: string;
+  /** Fires on every edit; parent decides whether to debounce, persist, or queue. */
+  onChange: (next: string) => void;
 }
 
-function unitPromptText(unit: ReferenceVideoUnit): string {
-  // Backend `parse_prompt` strips `Shot N (Xs):` headers when persisting
-  // shots[].text, so editing the raw stored text would re-parse as a
-  // header-less single shot and collapse multi-shot units. Reconstruct the
-  // headers unless the unit was saved in header-less mode (duration_override).
+/**
+ * Reconstruct the textarea-visible prompt for a unit from persisted shots.
+ *
+ * Backend `parse_prompt` strips `Shot N (Xs):` headers when persisting
+ * `shots[].text`, so editing the raw stored text would re-parse as a
+ * header-less single shot and collapse multi-shot units. We re-synthesize the
+ * headers unless the unit was saved in header-less mode (duration_override).
+ */
+export function unitPromptText(unit: ReferenceVideoUnit): string {
   if (unit.duration_override) {
     return unit.shots[0]?.text ?? "";
   }
@@ -29,31 +106,23 @@ function unitPromptText(unit: ReferenceVideoUnit): string {
 
 export function ReferenceVideoCard({
   unit,
-  projectName: _projectName,
+  projectName,
   episode: _episode,
-  onChangePrompt,
+  value,
+  onChange,
 }: ReferenceVideoCardProps) {
   const { t } = useTranslation("dashboard");
   const taRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
+  // caret anchor 通过 callback ref 转成 state，供 MentionPicker 的 floating-ui
+  // 作为参考元素。使用 state 而非 ref：floating-ui 的 `refs.setReference` 必须
+  // 在 reference 元素变更时感知到（初次 null → 挂载后的 span），state 变更会触发
+  // Picker 的 effect 重新 setReference。
+  const [anchorEl, setAnchorEl] = useState<HTMLSpanElement | null>(null);
 
-  // Store { value, syncedUnitId } together so we can reset value inline during render
-  // when the unit identity changes — this is the React-recommended "derived state" pattern
-  // and avoids both useEffect-based setState and ref-during-render lint errors.
-  const [valueState, setValueState] = useState(() => ({
-    text: unitPromptText(unit),
-    syncedUnitId: unit.unit_id,
-  }));
-
-  // Derive the effective text: if unit changed, compute the new text synchronously.
-  // Calling setValueState here triggers a re-render immediately after this one with
-  // the new state, while currentText is used for this render to avoid a blank flash.
-  let currentText = valueState.text;
-  if (valueState.syncedUnitId !== unit.unit_id) {
-    const resetText = unitPromptText(unit);
-    setValueState({ text: resetText, syncedUnitId: unit.unit_id });
-    currentText = resetText;
-  }
+  // 父组件把 prompt 当作受控值传入（可能是服务端原值，也可能是未保存的草稿）。
+  // 本地 state 仅保留 MentionPicker 相关的 UI 细节。
+  const currentText = value;
 
   const project = useProjectsStore((s) => s.currentProjectData);
 
@@ -66,6 +135,14 @@ export function ReferenceVideoCard({
   }, [project?.characters, project?.scenes, project?.props]);
 
   const tokens = useShotPromptHighlight(currentText, lookup);
+
+  // pickerOpen=false 是绝对多数路径（打字时 picker 只在 @ 触发短暂打开）。
+  // tokens 已被 useShotPromptHighlight memo 化，这里再把 tokens→ReactNode 列表缓存一层，
+  // 父组件或其他 state 引起的 re-render 就不会重新跑 renderHighlightedTokens 的 forEach。
+  const staticHighlightedNodes = useMemo(
+    () => renderHighlightedTokens(tokens, null, () => {}),
+    [tokens],
+  );
 
   const unknownMentions = useMemo(() => {
     const seen = new Set<string>();
@@ -81,70 +158,59 @@ export function ReferenceVideoCard({
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
-  const atStartRef = useRef<number | null>(null);
+  const [activeOptionId, setActiveOptionId] = useState<string | null>(null);
+  // atStart 既决定 caret anchor 何时插入（picker 定位用），又在 picker-select 时
+  // 定位 @ 插入点。用 state 以便 re-render 时 pre 能在正确位置插 caret anchor。
+  const [atStart, setAtStart] = useState<number | null>(null);
 
   const candidates: Record<AssetKind, MentionCandidate[]> = useMemo(() => {
-    function toCandidates(
-      bucket: Record<string, { character_sheet?: string; scene_sheet?: string; prop_sheet?: string }> | undefined,
-      sheetKey: "character_sheet" | "scene_sheet" | "prop_sheet",
-    ): MentionCandidate[] {
-      if (!bucket) return [];
-      return Object.entries(bucket).map(([name, data]) => ({
+    const buckets: Record<AssetKind, Record<string, unknown> | undefined> = {
+      character: project?.characters,
+      scene: project?.scenes,
+      prop: project?.props,
+    };
+    const out = {} as Record<AssetKind, MentionCandidate[]>;
+    for (const kind of ["character", "scene", "prop"] as const) {
+      const bucket = buckets[kind];
+      out[kind] = Object.entries(bucket ?? {}).map(([name, data]) => ({
         name,
-        imagePath: data[sheetKey] ?? null,
+        imagePath: (data as Partial<Record<(typeof SHEET_FIELD)[AssetKind], string>>)[SHEET_FIELD[kind]] ?? null,
       }));
     }
-    return {
-      character: toCandidates(project?.characters, "character_sheet"),
-      scene: toCandidates(project?.scenes, "scene_sheet"),
-      prop: toCandidates(project?.props, "prop_sheet"),
-    };
+    return out;
   }, [project?.characters, project?.scenes, project?.props]);
 
-  const setText = useCallback(
-    (next: string) => {
-      setValueState({ text: next, syncedUnitId: unit.unit_id });
-    },
-    [unit.unit_id],
-  );
-
-  const emitChange = useCallback(
-    (nextValue: string) => {
-      const refs = mergeReferences(nextValue, unit.references, project ?? null);
-      onChangePrompt(nextValue, refs);
-    },
-    [onChangePrompt, unit.references, project],
-  );
-
   const updatePickerFromCursor = useCallback((nextValue: string, cursor: number) => {
+    // 向左扫描寻找 @ 触发符。旧格式只允许 `\w` + CJK 作为正在输入的 query；
+    // 包裹格式 `@[query` 则允许标点参与过滤，直到遇到空白或闭合括号。
     let i = cursor - 1;
     while (i >= 0) {
       const ch = nextValue[i];
       if (ch === "@") {
         const prev = nextValue[i - 1];
-        // Only open the picker when the '@' is at a mention boundary:
-        // start-of-string or preceded by whitespace. This avoids triggering on
-        // `a@b` (email-like) or `@@foo` (double-@ typos).
-        if (i === 0 || /\s/.test(prev ?? "")) {
-          atStartRef.current = i;
-          setPickerQuery(nextValue.slice(i + 1, cursor));
+        // 与 MENTION_RE `(?<!\w)` 对齐：@ 左侧不能是 ASCII 词字符，否则视为 email/id 残片。
+        if (i === 0 || !/\w/.test(prev ?? "")) {
+          const rawQuery = nextValue.slice(i + 1, cursor);
+          const isWrapped = rawQuery.startsWith("[");
+          if (!isWrapped && !/^[\w一-鿿]*$/.test(rawQuery)) break;
+          setAtStart(i);
+          setPickerQuery(isWrapped ? rawQuery.slice(1) : rawQuery);
           setPickerOpen(true);
           return;
         }
         break;
       }
-      if (/\s/.test(ch)) break;
+      if (ch === "]" || /\s/.test(ch)) break;
       i--;
     }
-    atStartRef.current = null;
+    setAtStart(null);
     setPickerOpen(false);
     setPickerQuery("");
   }, []);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
-    setText(next);
-    emitChange(next);
+    onChange(next);
     updatePickerFromCursor(next, e.target.selectionStart ?? next.length);
   };
 
@@ -159,13 +225,40 @@ export function ReferenceVideoCard({
     // "focus left the editor" transitions — safe to close synchronously.
     setPickerOpen(false);
     setPickerQuery("");
-    atStartRef.current = null;
+    setAtStart(null);
+    setActiveOptionId(null);
+  }, []);
+
+  // Backspace 两次删除：当光标紧挨在一个完整 @mention 的末尾且无选区时，
+  // 第一次退格仅选中该 mention（让用户看到高亮），默认行为不删除；第二次按下时
+  // selectionStart !== selectionEnd，浏览器默认就会删除整个选区。
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Backspace") return;
+    const ta = e.currentTarget;
+    const start = ta.selectionStart ?? 0;
+    const end = ta.selectionEnd ?? 0;
+    if (start !== end) return;
+    const text = ta.value;
+    // 向左扫到最近的 @，用 MENTION_RE 判断它是否是一个完整 mention。
+    // 限制扫描范围（光标前 64 字符）避免长文本里 O(n) 扫每次 backspace。
+    const scanFrom = Math.max(0, start - 64);
+    const slice = text.slice(scanFrom, start);
+    for (const m of slice.matchAll(MENTION_RE)) {
+      const localIdx = m.index ?? 0;
+      const absoluteStart = scanFrom + localIdx;
+      const absoluteEnd = absoluteStart + m[0].length;
+      if (absoluteEnd === start) {
+        e.preventDefault();
+        ta.setSelectionRange(absoluteStart, absoluteEnd);
+        return;
+      }
+    }
   }, []);
 
   const handlePickerSelect = useCallback(
     (ref: { type: AssetKind; name: string }) => {
       const ta = taRef.current;
-      const start = atStartRef.current;
+      const start = atStart;
       if (!ta || start === null) {
         setPickerOpen(false);
         return;
@@ -173,20 +266,20 @@ export function ReferenceVideoCard({
       const before = currentText.slice(0, start);
       const cursor = ta.selectionStart ?? currentText.length;
       const after = currentText.slice(cursor);
-      const insert = `@${ref.name} `;
+      const insert = `@[${ref.name}] `;
       const next = before + insert + after;
-      setText(next);
-      emitChange(next);
+      onChange(next);
       setPickerOpen(false);
       setPickerQuery("");
-      atStartRef.current = null;
+      setAtStart(null);
+      setActiveOptionId(null);
       requestAnimationFrame(() => {
         ta.focus();
         const pos = before.length + insert.length;
         ta.setSelectionRange(pos, pos);
       });
     },
-    [currentText, setText, emitChange],
+    [currentText, atStart, onChange],
   );
 
   const onScroll = () => {
@@ -216,24 +309,9 @@ export function ReferenceVideoCard({
           aria-hidden
           className="pointer-events-none absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words p-3 font-mono text-sm leading-6"
         >
-          {tokens.map((tk, i) => {
-            if (tk.kind === "shot_header") {
-              return (
-                <span key={i} className="font-semibold text-indigo-300">
-                  {tk.text}
-                </span>
-              );
-            }
-            if (tk.kind === "mention") {
-              const palette = assetColor(tk.assetKind);
-              return (
-                <span key={i} className={`rounded px-0.5 ${palette.textClass} ${palette.bgClass}`}>
-                  {tk.text}
-                </span>
-              );
-            }
-            return <span key={i}>{tk.text}</span>;
-          })}
+          {pickerOpen
+            ? renderHighlightedTokens(tokens, atStart, setAnchorEl)
+            : staticHighlightedNodes}
           {currentText.endsWith("\n") ? "\u200b" : null}
         </pre>
 
@@ -242,34 +320,49 @@ export function ReferenceVideoCard({
           value={currentText}
           onChange={handleChange}
           onKeyUp={handleCursorUpdate}
+          onKeyDown={handleKeyDown}
           onClick={handleCursorUpdate}
           onBlur={handleTextareaBlur}
           onScroll={onScroll}
+          role="combobox"
+          aria-expanded={pickerOpen}
+          aria-controls={MENTION_PICKER_DEFAULT_ID}
+          aria-autocomplete="list"
+          aria-activedescendant={pickerOpen && activeOptionId ? activeOptionId : undefined}
+          aria-describedby={unknownMentions.length > 0 ? "reference-editor-unknown-desc" : undefined}
           placeholder={t("reference_editor_placeholder")}
-          aria-label={t("reference_editor_placeholder")}
+          aria-label={t("reference_editor_aria_name")}
           spellCheck={false}
           className="absolute inset-0 h-full w-full resize-none bg-transparent p-3 font-mono text-sm leading-6 text-transparent caret-gray-200 placeholder:text-gray-600 focus:outline-none"
         />
 
-        {pickerOpen && (
-          <div className="absolute bottom-1 left-3 z-20">
-            <MentionPicker
-              open
-              query={pickerQuery}
-              candidates={candidates}
-              onSelect={handlePickerSelect}
-              onClose={() => {
-                setPickerOpen(false);
-                setPickerQuery("");
-                atStartRef.current = null;
-              }}
-            />
-          </div>
+        {pickerOpen && anchorEl && (
+          <MentionPicker
+            open
+            query={pickerQuery}
+            candidates={candidates}
+            projectName={projectName}
+            anchorElement={anchorEl}
+            onSelect={handlePickerSelect}
+            onClose={() => {
+              setPickerOpen(false);
+              setPickerQuery("");
+              setAtStart(null);
+              setActiveOptionId(null);
+            }}
+            onActiveChange={setActiveOptionId}
+          />
         )}
       </div>
 
       {unknownMentions.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1" role="status" aria-live="polite">
+        <div
+          id="reference-editor-unknown-desc"
+          role="status"
+          aria-live="polite"
+          className="mt-2 flex flex-wrap gap-1"
+        >
+          <span className="sr-only">{t("reference_editor_unknown_mentions_label")}: </span>
           {unknownMentions.map((name) => {
             const palette = ASSET_COLORS.unknown;
             return (

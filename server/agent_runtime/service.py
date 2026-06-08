@@ -12,23 +12,28 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-try:
-    from claude_agent_sdk import list_sessions as sdk_list_sessions
-except ImportError:
-    sdk_list_sessions = None
-
-try:
-    from claude_agent_sdk import delete_session as sdk_delete_session
-except ImportError:
-    sdk_delete_session = None
+from claude_agent_sdk import (
+    delete_session as sdk_delete_session,
+)
+from claude_agent_sdk import (
+    delete_session_via_store,
+    list_sessions_from_store,
+)
+from claude_agent_sdk import (
+    list_sessions as sdk_list_sessions,
+)
 
 if TYPE_CHECKING:
     from server.routers.assistant import ImageAttachment
 
 logger = logging.getLogger(__name__)
 
+from fastapi import Request
 from fastapi.sse import ServerSentEvent
 
+from lib.agent_profile import agent_profile_dir
+from lib.app_data_dir import app_data_dir
+from lib.profile_manifest import VALID_CONTENT_MODES
 from lib.project_manager import ProjectManager
 from server.agent_runtime.message_utils import extract_plain_user_content
 from server.agent_runtime.models import SessionMeta, SessionStatus
@@ -45,32 +50,43 @@ from server.agent_runtime.turn_grouper import (
 class AssistantService:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
-        self._load_project_env(self.project_root)
-        self.projects_root = self.project_root / "projects"
+        self.projects_root = app_data_dir()
         self.data_dir = self.projects_root / ".agent_data"
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.pm = ProjectManager(self.projects_root)
         self.meta_store = SessionMetaStore()
-        self.transcript_adapter = SdkTranscriptAdapter()
         self.session_manager = SessionManager(
             project_root=self.project_root,
             data_dir=self.data_dir,
             meta_store=self.meta_store,
+            projects_root=self.projects_root,
         )
+        # Shared with SessionManager (lazy-cached there) so reads via the
+        # adapter and writes via SDK options use the same per-user namespace.
+        # None when ARCREEL_SDK_SESSION_STORE=off.
+        self._session_store = self.session_manager._build_session_store()
+        self.transcript_adapter = SdkTranscriptAdapter(store=self._session_store)
         self._startup_lock = asyncio.Lock()
         self._startup_done = False
         self._snapshot_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._snapshot_cache_max = 128
         self.stream_heartbeat_seconds = int(os.environ.get("ASSISTANT_STREAM_HEARTBEAT_SECONDS", "20"))
 
-    async def startup(self) -> None:
-        """Run async initialization (must be called from event loop)."""
+    async def startup(self, *, in_docker: bool = False, sandbox_enabled: bool = True) -> None:
+        """Run async initialization (must be called from event loop).
+
+        ``sandbox_enabled=False`` 时 SessionManager 关闭 SDK SandboxSettings 并
+        把 Bash 工具调用切到代码白名单路径（详见 SessionManager 同名属性）。
+        默认 ``True`` 保持 macOS / Linux 现状不变。
+        """
         if self._startup_done:
             return
         async with self._startup_lock:
             if self._startup_done:
                 return
+            self.session_manager._in_docker = bool(in_docker)
+            self.session_manager._sandbox_enabled = bool(sandbox_enabled)
             await self._interrupt_stale_running_sessions()
             self._startup_done = True
 
@@ -94,18 +110,33 @@ class AssistantService:
     ) -> list[SessionMeta]:
         """List sessions, injecting SDK summary as title when available."""
         sessions = await self.meta_store.list(project_name=project_name, status=status, limit=limit, offset=offset)
-        if not sessions or not project_name or sdk_list_sessions is None:
+        if not sessions or not project_name:
             return sessions
 
-        # Inject SDK summary as title
-        try:
-            project_cwd = str(self.projects_root / project_name)
-            sdk_sessions = await asyncio.to_thread(sdk_list_sessions, directory=project_cwd, include_worktrees=False)
-            summary_map = {s.session_id: s.summary for s in sdk_sessions}
-        except Exception:
-            logger.warning("SDK list_sessions failed, titles will be empty", exc_info=True)
+        project_cwd = str(self.projects_root / project_name)
+        sdk_sessions: list[Any] = []
+
+        if self._session_store is not None and list_sessions_from_store is not None:
+            try:
+                sdk_sessions = await list_sessions_from_store(self._session_store, directory=project_cwd)  # type: ignore[arg-type]
+            except Exception:
+                logger.warning(
+                    "SDK list_sessions_from_store failed, titles will be empty",
+                    exc_info=True,
+                )
+                return sessions
+        elif sdk_list_sessions is not None:
+            try:
+                sdk_sessions = await asyncio.to_thread(
+                    sdk_list_sessions, directory=project_cwd, include_worktrees=False
+                )
+            except Exception:
+                logger.warning("SDK list_sessions failed, titles will be empty", exc_info=True)
+                return sessions
+        else:
             return sessions
 
+        summary_map = {s.session_id: s.summary for s in sdk_sessions}
         return [SessionMeta(**{**s.model_dump(), "title": summary_map.get(s.id, s.title)}) for s in sessions]
 
     async def get_session(self, session_id: str) -> SessionMeta | None:
@@ -119,15 +150,27 @@ class AssistantService:
 
     async def delete_session(self, session_id: str) -> bool:
         """Delete session and cleanup."""
-        # Disconnect if active
         if session_id in self.session_manager.sessions:
             await self.session_manager.close_session(
                 session_id,
                 reason="session deleted",
             )
 
-        # Clean up SDK-side session files
-        if sdk_delete_session is not None:
+        if self._session_store is not None and delete_session_via_store is not None:
+            # SDK derives project_key from `directory`; without it the key is
+            # computed from server cwd and never matches inserted rows, so the
+            # delete becomes a silent no-op. Resolve project cwd from meta.
+            meta = await self.meta_store.get(session_id)
+            project_cwd = str(self.projects_root / meta.project_name) if meta else None
+            try:
+                await delete_session_via_store(self._session_store, session_id, directory=project_cwd)  # type: ignore[arg-type]
+            except Exception:
+                logger.warning(
+                    "delete_session_via_store failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+        elif sdk_delete_session is not None:
             try:
                 await asyncio.to_thread(sdk_delete_session, session_id)
             except Exception:
@@ -302,9 +345,17 @@ class AssistantService:
     # ==================== Streaming ====================
 
     async def stream_events(
-        self, session_id: str, *, meta: SessionMeta | None = None
+        self, session_id: str, *, meta: SessionMeta | None = None, request: Request | None = None
     ) -> AsyncIterator[ServerSentEvent]:
-        """Stream SSE events for a session."""
+        """Stream SSE events for a session.
+
+        Consumes the session's messages through ``SessionManager.stream_messages``
+        (an async context manager): replay messages are accumulated until the
+        ``_replay_done`` boundary, where the projector is built and the snapshot
+        emitted; live messages then drive patch/delta/question/status events. On
+        the ``_idle`` sentinel we poll ``request.is_disconnected()`` so a dropped
+        client triggers deterministic unsubscribe via ``__aexit__`` (see ADR-0005).
+        """
         if meta is None:
             meta = await self.meta_store.get(session_id)
             if meta is None:
@@ -316,47 +367,51 @@ class AssistantService:
                 yield event
             return
 
-        queue = await self.session_manager.subscribe(session_id, replay_buffer=True)
-        try:
-            async for event in self._stream_running_session(meta, session_id, initial_status, queue):
-                yield event
-        finally:
-            await self.session_manager.unsubscribe(session_id, queue)
+        async with self.session_manager.stream_messages(
+            session_id, replay=True, idle_timeout=self.stream_heartbeat_seconds
+        ) as stream:
+            replayed: list[dict[str, Any]] = []
+            projector: AssistantStreamProjector | None = None
+            status: SessionStatus = initial_status
+            async for message in stream:
+                # 直播阶段每轮顶部检查断线;不依赖 _idle 作为唤醒条件,持续高频消息
+                # 流下断线一样能立刻发现。回放阶段尚未对客户端 yield 过,不查。
+                if projector is not None and request is not None and await request.is_disconnected():
+                    break
 
-    async def _stream_running_session(
-        self,
-        meta: SessionMeta,
-        session_id: str,
-        initial_status: SessionStatus,
-        queue: asyncio.Queue,
-    ) -> AsyncIterator[ServerSentEvent]:
-        """Inner generator for a running session's SSE stream."""
-        replayed_messages, replay_overflowed = self._drain_replay(queue)
-        if replay_overflowed:
-            return
+                msg_type = message.get("type", "")
 
-        status = await self.session_manager.get_status(session_id) or initial_status
-        projector = await self._build_projector(meta, session_id, replayed_messages)
-        snapshot_events = await self._emit_running_snapshot(session_id, status, projector)
-        for event in snapshot_events:
-            yield event
-        if status != "running":
-            return
+                if projector is None:
+                    # Replay phase: accumulate buffer messages until the boundary.
+                    if msg_type == "_replay_done":
+                        status = await self.session_manager.get_status(session_id) or initial_status
+                        projector = await self._build_projector(meta, session_id, replayed)
+                        for event in await self._emit_running_snapshot(session_id, status, projector):
+                            yield event
+                        if status != "running":
+                            return
+                        continue
+                    replayed.append(message)
+                    continue
 
-        while True:
-            try:
-                message = await asyncio.wait_for(queue.get(), timeout=self.stream_heartbeat_seconds)
+                # Live phase.
+                if msg_type == "_idle":
+                    # 断线已在循环顶部判过;_idle 仅作为「无消息也要醒来」的 backstop,
+                    # 用来兜底「会话状态转换没带消息广播」这种异常路径。
+                    event = await self._handle_heartbeat_timeout(session_id, status, projector)
+                    if event is not None:
+                        yield event
+                        break
+                    continue
+
+                if msg_type == "_queue_overflow":
+                    break
+
                 events, should_break = await self._dispatch_live_message(message, projector, session_id)
                 for event in events:
                     yield event
                 if should_break:
                     break
-            except TimeoutError:
-                event = await self._handle_heartbeat_timeout(session_id, status, projector)
-                if event is not None:
-                    yield event
-                    break
-                continue
 
     async def _emit_completed_snapshot(
         self, meta: SessionMeta, session_id: str, status: SessionStatus
@@ -416,23 +471,6 @@ class AssistantService:
                 )
             )
         return events
-
-    @staticmethod
-    def _drain_replay(
-        queue: asyncio.Queue,
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Drain replayed messages from *queue*, detecting overflow sentinel."""
-        replayed: list[dict[str, Any]] = []
-        while True:
-            try:
-                msg = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(msg, dict):
-                if msg.get("type") == "_queue_overflow":
-                    return replayed, True
-                replayed.append(msg)
-        return replayed, False
 
     async def _dispatch_live_message(
         self,
@@ -498,11 +536,23 @@ class AssistantService:
                 return events, True
 
         if msg_type == "result":
+            status = self._resolve_result_status(message)
+            if status == "error":
+                logger.warning(
+                    "assistant session result error",
+                    extra={
+                        "session_id": session_id,
+                        "subtype": message.get("subtype"),
+                        "is_error": message.get("is_error"),
+                        "api_error_status": message.get("api_error_status"),  # SDK 0.1.76+
+                        "stop_reason": message.get("stop_reason"),
+                    },
+                )
             events.append(
                 self._sse_event(
                     "status",
                     self._build_status_event_payload(
-                        status=self._resolve_result_status(message),
+                        status=status,
                         session_id=session_id,
                         result_message=message,
                     ),
@@ -552,6 +602,19 @@ class AssistantService:
         """Build an SSE event for FastAPI's EventSourceResponse."""
         return ServerSentEvent(event=event, data=data)
 
+    def _resolve_project_cwd_safe(self, project_name: str) -> Path | None:
+        """Resolve the project's working directory, returning None on failure.
+
+        ``SdkTranscriptAdapter`` needs ``project_cwd`` to derive the
+        per-project key when reading from the SessionStore. If the project
+        directory is missing (deleted, never materialized in tests, etc.)
+        we fall back to None — the store helper / SDK defaults handle that.
+        """
+        try:
+            return self.pm.get_project_path(project_name)
+        except (FileNotFoundError, ValueError):
+            return None
+
     async def _build_projector(
         self,
         meta: SessionMeta,
@@ -559,7 +622,8 @@ class AssistantService:
         replayed_messages: list[dict[str, Any]] | None = None,
     ) -> AssistantStreamProjector:
         """Build projector state from transcript history + in-memory buffer."""
-        history_messages = await asyncio.to_thread(self.transcript_adapter.read_raw_messages, meta.id)
+        project_cwd = self._resolve_project_cwd_safe(meta.project_name)
+        history_messages = await self.transcript_adapter.read_raw_messages(meta.id, project_cwd)
         projector = AssistantStreamProjector(initial_messages=history_messages)
 
         # UUID set for primary dedup
@@ -571,6 +635,11 @@ class AssistantService:
         buffer = replayed_messages
         if buffer is None:
             buffer = self.session_manager.get_buffered_messages(session_id)
+
+        # Pre-scan buffer for real (non-echo) user texts; used as dedup fallback
+        # when the DB transcript momentarily lags the in-memory buffer (eager
+        # flush is fire-and-forget + SDK coalesces frames under a slow store).
+        buffer_real_user_texts = self._collect_buffer_real_user_texts(buffer or [])
 
         for msg in buffer or []:
             if not isinstance(msg, dict):
@@ -587,7 +656,14 @@ class AssistantService:
             if self._is_real_user_message(msg):
                 tail_fps.clear()
 
-            if not self._is_buffer_duplicate(msg, msg_type, transcript_uuids, tail_fps, history_messages):
+            if not self._is_buffer_duplicate(
+                msg,
+                msg_type,
+                transcript_uuids,
+                tail_fps,
+                history_messages,
+                buffer_real_user_texts,
+            ):
                 # A local_echo that survived dedup is a genuinely new round;
                 # clear tail fingerprints so the upcoming assistant reply
                 # isn't falsely matched against a prior round's content.
@@ -604,16 +680,29 @@ class AssistantService:
         transcript_uuids: set[str],
         tail_fps: set[str],
         history_messages: list[dict[str, Any]],
+        buffer_real_user_texts: set[str] | None = None,
     ) -> bool:
-        """Check if a groupable buffer message duplicates a transcript message."""
+        """Check if a groupable buffer message duplicates a transcript message.
+
+        ``buffer_real_user_texts`` is a pre-scan of the same buffer the caller
+        is iterating; an echo that lacks a transcript-side match still gets
+        deduped if the buffer itself already carries a same-text real user
+        (covers eager flush's DB-lag window when SDK coalesces frames under
+        a slow store).
+        """
         # 1. UUID dedup
         uuid = msg.get("uuid")
         if uuid and uuid in transcript_uuids:
             return True
 
-        # 2. Local echo dedup
-        if msg.get("local_echo") and self._echo_in_transcript(msg, history_messages):
-            return True
+        # 2. Local echo dedup — transcript first, buffer fallback
+        if msg.get("local_echo"):
+            if self._echo_in_transcript(msg, history_messages):
+                return True
+            if buffer_real_user_texts:
+                echo_text = self._extract_plain_user_content(msg)
+                if echo_text and echo_text in buffer_real_user_texts:
+                    return True
 
         # 3. Content fingerprint dedup (fallback for UUID-less buffer messages)
         if not uuid and msg_type in {"assistant", "result"}:
@@ -660,13 +749,17 @@ class AssistantService:
         if status == "error":
             is_error = True
 
-        return {
+        payload: dict[str, Any] = {
             "status": status,
             "subtype": subtype,
             "stop_reason": stop_reason,
             "is_error": is_error,
             "session_id": session_id,
         }
+        api_error_status = message.get("api_error_status")  # SDK 0.1.76+
+        if api_error_status is not None:
+            payload["api_error_status"] = api_error_status
+        return payload
 
     async def _with_session_metadata(
         self,
@@ -775,6 +868,25 @@ class AssistantService:
     _extract_plain_user_content = staticmethod(extract_plain_user_content)
 
     @staticmethod
+    def _collect_buffer_real_user_texts(buffer: list[dict[str, Any]] | None) -> set[str]:
+        """Pre-scan buffer for plain text of all real (non-echo) user messages.
+
+        Used by _is_buffer_duplicate as a fallback dedup source when the DB
+        transcript is momentarily behind the in-memory buffer (eager flush is
+        fire-and-forget; SDK may coalesce frames under slow store).
+        """
+        texts: set[str] = set()
+        for msg in buffer or []:
+            if not isinstance(msg, dict):
+                continue
+            if not AssistantService._is_real_user_message(msg):
+                continue
+            text = AssistantService._extract_plain_user_content(msg)
+            if text:
+                texts.add(text)
+        return texts
+
+    @staticmethod
     def _parse_iso_datetime(value: Any) -> datetime | None:
         if not isinstance(value, str) or not value.strip():
             return None
@@ -797,14 +909,19 @@ class AssistantService:
 
     # ==================== Skills ====================
 
-    # Display metadata for user-facing skills (label + Lucide icon name)
-    _SKILL_DISPLAY_META: dict[str, dict[str, str]] = {
-        "manga-workflow": {"label": "视频工作流", "icon": "clapperboard"},
-        "generate-script": {"label": "生成剧本", "icon": "scroll-text"},
-        "generate-storyboard": {"label": "生成分镜图", "icon": "layout-grid"},
-        "generate-video": {"label": "生成视频", "icon": "film"},
-        "generate-assets": {"label": "生成资产图", "icon": "users"},
-        "compose-video": {"label": "合成视频", "icon": "scissors"},
+    # Lucide icon hint for each user-invocable skill. The display name is
+    # **not** stored here — the frontend resolves it from i18n
+    # ``dashboard:skill_name_<id>`` (single source of truth for skill labels
+    # lives in ``frontend/src/i18n/{zh,en,vi}/dashboard.ts``).
+    # ``tests/test_frontend_skill_i18n.py`` cross-checks SKILL.md against
+    # those keys so adding a user-invocable skill without translations fails CI.
+    _SKILL_ICONS: dict[str, str] = {
+        "manga-workflow": "clapperboard",
+        "generate-storyboard": "images",
+        "generate-grid": "grid-2x2",
+        "generate-video": "film",
+        "generate-assets": "users",
+        "compose-video": "scissors",
     }
 
     def list_available_skills(self, project_name: str | None = None) -> list[dict[str, str]]:
@@ -813,7 +930,7 @@ class AssistantService:
             self.pm.get_project_path(project_name)
 
         source_roots = {
-            "agent": self.project_root / "agent_runtime_profile" / ".claude" / "skills",
+            "agent": agent_profile_dir() / ".claude" / "skills",
         }
 
         skills: list[dict[str, str]] = []
@@ -830,8 +947,8 @@ class AssistantService:
             for skill_dir in directories:
                 if not skill_dir.is_dir():
                     continue
-                skill_file = skill_dir / "SKILL.md"
-                if not skill_file.exists():
+                skill_file = self._resolve_skill_entry_file(skill_dir)
+                if skill_file is None:
                     continue
 
                 try:
@@ -852,13 +969,42 @@ class AssistantService:
                     "scope": scope,
                     "path": str(skill_file),
                 }
-                display = self._SKILL_DISPLAY_META.get(metadata["name"])
-                if display:
-                    skill_entry["label"] = display["label"]
-                    skill_entry["icon"] = display["icon"]
+                icon = self._SKILL_ICONS.get(metadata["name"])
+                if icon:
+                    skill_entry["icon"] = icon
                 skills.append(skill_entry)
 
         return skills
+
+    @staticmethod
+    def _resolve_skill_entry_file(skill_dir: Path) -> Path | None:
+        # profile 端的 content_mode 变体（SKILL.narration.md / SKILL.drama.md）只在 sync
+        # 进项目目录时才会被物化为 SKILL.md；列表接口直接扫 profile 时必须自己识别变体，
+        # 否则 manga-workflow 这类 variant-only skill 永远拿不到。
+        #
+        # 查找契约与 tests/test_frontend_skill_i18n.py:_find_skill_md 保持一致：
+        # 用 is_file 严格筛文件、按 sorted(VALID_CONTENT_MODES) 显式枚举有效模式、
+        # 校验所有变体的 user-invocable 状态一致。不一致时 warning 后返回 None
+        # 跳过该 skill——避免列表里随机选到某个 mode 的 frontmatter 导致行为漂移。
+        common = skill_dir / "SKILL.md"
+        if common.is_file():
+            return common
+        variants = [skill_dir / f"SKILL.{mode}.md" for mode in sorted(VALID_CONTENT_MODES)]
+        existing = [v for v in variants if v.is_file()]
+        if not existing:
+            return None
+        try:
+            states = {AssistantService._load_skill_metadata(v, skill_dir.name)["user_invocable"] for v in existing}
+        except OSError:
+            return None
+        if len(states) > 1:
+            logger.warning(
+                "skill %s 各 content_mode 变体的 user-invocable 不一致，跳过；"
+                "请保证所有 SKILL.<mode>.md frontmatter 的 user-invocable 字段相同",
+                skill_dir.name,
+            )
+            return None
+        return existing[0]
 
     @staticmethod
     def _load_skill_metadata(skill_file: Path, fallback_name: str) -> dict[str, Any]:
@@ -906,16 +1052,3 @@ class AssistantService:
             "description": description,
             "user_invocable": user_invocable,
         }
-
-    @staticmethod
-    def _load_project_env(project_root: Path) -> None:
-        """Load .env file if exists."""
-        env_path = project_root / ".env"
-        if not env_path.exists():
-            return
-        try:
-            from dotenv import load_dotenv
-
-            load_dotenv(env_path, override=False)
-        except ImportError:
-            pass

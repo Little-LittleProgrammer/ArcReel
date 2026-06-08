@@ -14,20 +14,22 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib import PROJECT_ROOT
+from lib.app_data_dir import app_data_dir
 from lib.generation_queue import get_generation_queue
 from lib.grid.layout import calculate_grid_layout
 from lib.grid.models import GridGeneration
 from lib.grid.prompt_builder import build_grid_prompt
 from lib.grid_manager import GridManager
+from lib.i18n import Translator
 from lib.project_manager import ProjectManager
+from lib.script_editor import ScriptEditError
 from lib.storyboard_sequence import get_storyboard_items, group_scenes_by_segment_break
 from server.auth import CurrentUser
 
 router = APIRouter(prefix="/projects/{project_name}", tags=["grids"])
 
 # 初始化管理器
-pm = ProjectManager(PROJECT_ROOT / "projects")
+pm = ProjectManager(app_data_dir())
 
 
 def get_project_manager() -> ProjectManager:
@@ -45,9 +47,12 @@ def _build_grid_task_payload(
     cols: int,
     grid_aspect_ratio: str,
     video_aspect_ratio: str,
-    backend_snapshot: dict,
 ) -> dict:
-    """Build a consistent payload dict for grid generation tasks."""
+    """Build a consistent payload dict for grid generation tasks.
+
+    入队不携带 provider 信息——provider 在执行时由 ConfigResolver 按当前项目配置解析
+    （见 docs/adr/0001）。
+    """
     return {
         "prompt": prompt,
         "script_file": script_file,
@@ -58,7 +63,6 @@ def _build_grid_task_payload(
         "cols": cols,
         "grid_aspect_ratio": grid_aspect_ratio,
         "video_aspect_ratio": video_aspect_ratio,
-        **backend_snapshot,
     }
 
 
@@ -87,6 +91,7 @@ async def generate_grid(
     episode: int,
     req: GenerateGridRequest,
     _user: CurrentUser,
+    _t: Translator,
 ):
     """
     提交宫格图生成任务到队列，按分段分组，每组 N>=4 个场景生成一个宫格图。
@@ -94,8 +99,6 @@ async def generate_grid(
     立即返回 grid_ids 和 task_ids。生成由 GenerationWorker 异步执行。
     """
     try:
-        from server.routers.generate import _snapshot_image_backend
-
         project = get_project_manager().load_project(project_name)
         script = get_project_manager().load_script(project_name, req.script_file)
         project_path = get_project_manager().get_project_path(project_name)
@@ -148,14 +151,14 @@ async def generate_grid(
             else:
                 chunks.append(group)
 
-            backend_snapshot = _snapshot_image_backend(project_name)
-
             for chunk in chunks:
                 chunk_ids = [item[id_field] for item in chunk]
                 chunk_layout = calculate_grid_layout(len(chunk_ids), aspect_ratio)
                 if chunk_layout is None:
                     continue
 
+                # provider/model 由 execute_grid_task 在 _resolve_effective_image_backend
+                # 之后回填，因为只有 task 层能根据 reference_images 判断走 T2I 还是 I2I 槽
                 grid = GridGeneration.create(
                     episode=episode,
                     script_file=req.script_file,
@@ -163,8 +166,8 @@ async def generate_grid(
                     rows=chunk_layout.rows,
                     cols=chunk_layout.cols,
                     grid_size=chunk_layout.grid_size,
-                    provider=backend_snapshot.get("image_provider", ""),
-                    model=backend_snapshot.get("image_model", ""),
+                    provider="",
+                    model="",
                 )
 
                 prompt = build_grid_prompt(
@@ -195,7 +198,6 @@ async def generate_grid(
                         cols=chunk_layout.cols,
                         grid_aspect_ratio=chunk_layout.grid_aspect_ratio,
                         video_aspect_ratio=aspect_ratio,
-                        backend_snapshot=backend_snapshot,
                     ),
                     script_file=req.script_file,
                     source="webui",
@@ -215,6 +217,9 @@ async def generate_grid(
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
+    except ScriptEditError as e:
+        # 脏脚本(分镜数组键损坏)→ 4xx 客户端错误而非 5xx,走 i18n 不直接暴露 str(e)
+        raise HTTPException(status_code=400, detail=_t("script_data_corrupted", reason=str(e)))
     except Exception as e:
         logger.exception("宫格生成请求处理失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -266,8 +271,6 @@ async def get_grid(project_name: str, grid_id: str, _user: CurrentUser):
 async def regenerate_grid(project_name: str, grid_id: str, _user: CurrentUser):
     """重置宫格图状态并重新入队生成任务。"""
     try:
-        from server.routers.generate import _snapshot_image_backend
-
         project_path = get_project_manager().get_project_path(project_name)
         gm = GridManager(project_path)
         grid = gm.get(grid_id)
@@ -276,6 +279,9 @@ async def regenerate_grid(project_name: str, grid_id: str, _user: CurrentUser):
 
         grid.status = "pending"
         grid.error_message = None
+        # 清空旧 metadata，由 execute_grid_task 按 needs_i2i 重新回填
+        grid.provider = ""
+        grid.model = ""
         gm.save(grid)
 
         project = get_project_manager().load_project(project_name)
@@ -283,7 +289,6 @@ async def regenerate_grid(project_name: str, grid_id: str, _user: CurrentUser):
         layout = calculate_grid_layout(len(grid.scene_ids), aspect_ratio)
         grid_aspect_ratio = layout.grid_aspect_ratio if layout else aspect_ratio
 
-        backend_snapshot = _snapshot_image_backend(project_name)
         extra_reference_images = [
             ref.path for ref in (grid.reference_images or []) if getattr(ref, "ref_type", "") == "task"
         ]
@@ -303,7 +308,6 @@ async def regenerate_grid(project_name: str, grid_id: str, _user: CurrentUser):
                 cols=grid.cols,
                 grid_aspect_ratio=grid_aspect_ratio,
                 video_aspect_ratio=aspect_ratio,
-                backend_snapshot=backend_snapshot,
             ),
             script_file=grid.script_file,
             source="webui",

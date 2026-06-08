@@ -106,7 +106,6 @@ class TestGeminiVideoBackendGenerate:
             prompt="a cat walking",
             output_path=output,
             duration_seconds=8,
-            negative_prompt="no music",
         )
 
         result = await backend.generate(request)
@@ -216,8 +215,8 @@ class TestGeminiVideoBackendGenerate:
         await backend.generate(request)
         mock_rate_limiter.acquire_async.assert_called_once_with(backend._video_model)
 
-    async def test_default_negative_prompt(self, backend, tmp_path):
-        """未指定 negative_prompt 时使用默认值。"""
+    async def test_no_negative_prompt_in_config(self, backend, tmp_path):
+        """negative_prompt 改走 prompt 文本通道，GenerateVideosConfig 不再带该字段。"""
         output = tmp_path / "out.mp4"
 
         mock_op = _make_done_operation()
@@ -226,14 +225,12 @@ class TestGeminiVideoBackendGenerate:
         request = VideoGenerationRequest(
             prompt="test",
             output_path=output,
-            negative_prompt=None,
         )
 
         await backend.generate(request)
 
-        # 验证 GenerateVideosConfig 被调用时包含默认 negative_prompt
         config_call = backend._types.GenerateVideosConfig.call_args
-        assert "music" in config_call.kwargs.get("negative_prompt", "")
+        assert "negative_prompt" not in config_call.kwargs
 
 
 class TestGeminiRetryBehavior:
@@ -358,3 +355,66 @@ class TestDownloadVideo:
 
         with pytest.raises(RuntimeError, match="无法获取视频数据"):
             backend._download_video(mock_ref, output)
+
+
+class TestGeminiResumeVideo:
+    """resume_video 路径：初次 + mid-poll NOT_FOUND 都归类为 ResumeExpiredError。"""
+
+    async def test_mid_poll_not_found_classified_as_resume_expired(self, backend, tmp_path):
+        from lib.video_backends.base import ResumeExpiredError
+
+        # 初次 operations.get 返回 pending 让 poll 进入循环；poll_fn 中抛 NOT_FOUND
+        pending_op = MagicMock()
+        pending_op.done = False
+        get_calls = {"n": 0}
+
+        async def _fake_get(_op):
+            get_calls["n"] += 1
+            if get_calls["n"] == 1:
+                return pending_op
+            raise RuntimeError("operation not found mid poll")
+
+        backend._client.aio.operations.get = AsyncMock(side_effect=_fake_get)
+        # GenerateVideosOperation.model_validate 用 MagicMock，返回任意对象即可
+        backend._types.GenerateVideosOperation.model_validate = MagicMock(return_value=pending_op)
+
+        request = VideoGenerationRequest(prompt="x", output_path=tmp_path / "out.mp4")
+        with patch("lib.video_backends.base.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ResumeExpiredError) as ei:
+                await backend.resume_video("op-xyz", request)
+        assert ei.value.job_id == "op-xyz"
+
+    async def test_initial_get_not_found_classified_as_resume_expired(self, backend, tmp_path):
+        from lib.video_backends.base import ResumeExpiredError
+
+        backend._client.aio.operations.get = AsyncMock(side_effect=RuntimeError("operation not found"))
+        backend._types.GenerateVideosOperation.model_validate = MagicMock(return_value=MagicMock())
+
+        request = VideoGenerationRequest(prompt="x", output_path=tmp_path / "out.mp4")
+        with pytest.raises(ResumeExpiredError):
+            await backend.resume_video("op-not-found", request)
+
+
+class TestIsGeminiNotFound:
+    """fix #647 #6：INVALID_ARGUMENT 不归过期，只保留 404 / NOT_FOUND / "not found" / "expired"。"""
+
+    def test_excludes_invalid_argument(self):
+        from lib.video_backends.gemini import _is_gemini_not_found
+
+        exc = RuntimeError("INVALID_ARGUMENT: malformed operation name")
+        assert _is_gemini_not_found(exc) is False
+
+    def test_not_found_string_matches(self):
+        from lib.video_backends.gemini import _is_gemini_not_found
+
+        assert _is_gemini_not_found(RuntimeError("operation not found"))
+
+    def test_expired_string_matches(self):
+        from lib.video_backends.gemini import _is_gemini_not_found
+
+        assert _is_gemini_not_found(RuntimeError("resource expired after 24h"))
+
+    def test_unrelated_runtime_error_returns_false(self):
+        from lib.video_backends.gemini import _is_gemini_not_found
+
+        assert _is_gemini_not_found(RuntimeError("rate limit exceeded")) is False

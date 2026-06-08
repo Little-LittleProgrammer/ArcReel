@@ -26,7 +26,7 @@ class TestImageGenerationResultQualityField:
         result = ImageGenerationResult(
             image_path=Path("/tmp/img.png"),
             provider="openai",
-            model="gpt-image-1.5",
+            model="gpt-image-2",
         )
         assert result.quality is None
 
@@ -37,7 +37,7 @@ class TestImageGenerationResultQualityField:
             result = ImageGenerationResult(
                 image_path=Path("/tmp/img.png"),
                 provider="openai",
-                model="gpt-image-1.5",
+                model="gpt-image-2",
                 quality=quality_value,
             )
             assert result.quality == quality_value
@@ -48,7 +48,7 @@ class TestImageGenerationResultQualityField:
         result = ImageGenerationResult(
             image_path=Path("/tmp/img.png"),
             provider="openai",
-            model="gpt-image-1.5",
+            model="gpt-image-2",
             quality=None,
         )
         assert result.quality is None
@@ -103,7 +103,7 @@ class TestOpenAIImageBackendQuality:
             backend = OpenAIImageBackend(api_key="test-key")
 
             expected = {
-                "512PX": "low",
+                "512px": "low",
                 "1K": "medium",
                 "2K": "high",
                 "4K": "high",
@@ -118,8 +118,8 @@ class TestOpenAIImageBackendQuality:
                 result = await backend.generate(request)
                 assert result.quality == expected_quality, f"image_size={img_size}"
 
-    async def test_unknown_size_defaults_to_medium(self, tmp_path: Path):
-        """未知 image_size 应 fallback 到 'medium'。"""
+    async def test_unknown_size_result_quality_is_none(self, tmp_path: Path):
+        """未知 image_size 在新语义下不再 fallback 到 'medium'，quality 返回 None。"""
         b64_data = base64.b64encode(b"img").decode()
         mock_client = AsyncMock()
         mock_client.images.generate = AsyncMock(return_value=_make_mock_image_response(b64_data))
@@ -137,7 +137,7 @@ class TestOpenAIImageBackendQuality:
             )
             result = await backend.generate(request)
 
-        assert result.quality == "medium"
+        assert result.quality is None
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ class TestUsageRepositoryQualityToCostCalculator:
         mock_row.id = 1
         mock_row.provider = PROVIDER_OPENAI
         mock_row.call_type = "image"
-        mock_row.model = "gpt-image-1.5"
+        mock_row.model = "gpt-image-2"
         mock_row.resolution = "1K"
         mock_row.duration_seconds = None
         mock_row.generate_audio = True
@@ -250,7 +250,7 @@ class TestUsageRepositoryQualityToCostCalculator:
         mock_row.id = 1
         mock_row.provider = PROVIDER_OPENAI
         mock_row.call_type = "image"
-        mock_row.model = "gpt-image-1.5"
+        mock_row.model = "gpt-image-2"
         mock_row.resolution = "1K"
         mock_row.duration_seconds = None
         mock_row.generate_audio = True

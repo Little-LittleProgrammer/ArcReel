@@ -11,7 +11,7 @@ from lib.cost_calculator import cost_calculator
 from lib.custom_provider import is_custom_provider, parse_provider_id
 from lib.db.base import DEFAULT_USER_ID, dt_to_iso, utc_now
 from lib.db.models.api_call import ApiCall
-from lib.db.repositories.base import BaseRepository
+from lib.db.repositories.base import BaseRepository, rowcount
 from lib.providers import PROVIDER_GEMINI, CallType
 
 
@@ -58,6 +58,10 @@ def _row_to_dict(row: ApiCall) -> dict[str, Any]:
         "usage_tokens": row.usage_tokens,
         "input_tokens": row.input_tokens,
         "output_tokens": row.output_tokens,
+        "image_input_tokens": row.image_input_tokens,
+        "image_output_tokens": row.image_output_tokens,
+        "text_input_tokens": row.text_input_tokens,
+        "text_output_tokens": row.text_output_tokens,
         "created_at": dt_to_iso(row.created_at),
     }
 
@@ -101,6 +105,111 @@ class UsageRepository(BaseRepository):
         await self.session.refresh(row)
         return row.id
 
+    async def finalize_pending_by_call_id(
+        self,
+        *,
+        call_id: int,
+        cost_amount: float | None = None,
+        currency: str | None = None,
+        status: str = "success",
+        service_tier: str = "default",
+        usage_tokens: int | None = None,
+        generate_audio: bool | None = None,
+    ) -> int:
+        """Resume 路径专用：按 call_id 精准翻 pending → success/failed。
+
+        Repo WHERE 子句包含 ``status='pending'`` —— 已 success 行不 touch
+        （防止 generate 已 finish_call 后崩、resume 反向把 success 行覆写）。
+        cost_amount/currency 行为对齐 finish_call：
+        - cost_amount=None + status='success' → 按 ApiCall 行字段调 cost_calculator
+          算实际 cost（与 generate 路径等价记账，避免视频已生成但 cost=0 永久漏记）
+        - cost_amount=None + status='failed' → 走 0.0/USD（失败不计费）
+        - 显式传 cost_amount → 直接用
+        service_tier 由 caller 从原 generate 上下文透传（ApiCall 模型无此列，
+        与 finish_call 同 caller-passed 模式），非 default 档位才能按真实档计费。
+        usage_tokens 同样由 caller 从 resume_video 返回的 VideoGenerationResult.usage_tokens
+        透传：Ark video 按 usage_tokens 计费，未传则 cost 永远为 0；其它 provider 不依赖该字段。
+        generate_audio 由 caller 从 backend 返回值透传：provider 在 submit 后可能降级/关闭音频，
+        与 finish_call 的 ``generate_audio is not None`` 覆盖语义对齐，避免按请求值误计费。
+        duration_ms 按 (finished_at - started_at) 回写，让 get_stats_grouped_by_provider
+        的时长汇总不会因 resume 完成的调用 duration_ms=NULL 而系统性压低。
+        provider 端已扣费的事实通过 status='pending' WHERE 保护——绝不触发再次扣费。
+        返回受影响行数（0=幂等无操作；1=正常翻一行）。
+        """
+        finished_at = utc_now()
+
+        # 无条件 fetch row：既用于 auto-calc cost 路径，也用于 duration_ms 回写
+        # （即便 caller 显式传 cost_amount，duration_ms 计算仍需要 started_at）。
+        # row.status='pending' 守卫继续由下面的 UPDATE WHERE 子句保证幂等性。
+        select_result = await self.session.execute(select(ApiCall).where(ApiCall.id == call_id))
+        row = select_result.scalar_one_or_none()
+        if row is None:
+            return 0
+
+        duration_ms = 0
+        try:
+            duration_ms = int((finished_at - row.started_at).total_seconds() * 1000)
+        except (ValueError, TypeError):
+            duration_ms = 0
+
+        # backend 回写的实际 generate_audio 覆盖 start_call 时的请求值
+        # （与 finish_call 同语义；用于 cost_calculator 输入及 UPDATE 回写）
+        effective_generate_audio = generate_audio if generate_audio is not None else row.generate_audio
+
+        final_cost_amount = 0.0
+        final_currency = currency or "USD"
+
+        if cost_amount is not None:
+            final_cost_amount = cost_amount
+            final_currency = currency or "USD"
+        elif status == "success" and row.status == "pending":
+            effective_provider = row.provider or PROVIDER_GEMINI
+            custom_price_input: float | None = None
+            custom_price_output: float | None = None
+            custom_currency: str | None = None
+            if is_custom_provider(effective_provider):
+                from lib.db.repositories.custom_provider_repo import CustomProviderRepository
+
+                repo = CustomProviderRepository(self.session)
+                price_model = await repo.get_model_by_ids(parse_provider_id(effective_provider), row.model or "")
+                if price_model:
+                    custom_price_input = price_model.price_input
+                    custom_price_output = price_model.price_output
+                    custom_currency = price_model.currency
+
+            final_cost_amount, final_currency = cost_calculator.calculate_cost(
+                provider=effective_provider,
+                call_type=row.call_type,  # type: ignore[arg-type]
+                model=row.model,
+                resolution=row.resolution,
+                aspect_ratio=row.aspect_ratio,
+                duration_seconds=row.duration_seconds,
+                generate_audio=bool(effective_generate_audio),
+                service_tier=service_tier,
+                usage_tokens=usage_tokens,
+                custom_price_input=custom_price_input,
+                custom_price_output=custom_price_output,
+                custom_currency=custom_currency,
+            )
+
+        result = await self.session.execute(
+            update(ApiCall)
+            .where(ApiCall.id == call_id, ApiCall.status == "pending")
+            .values(
+                status=status,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+                cost_amount=final_cost_amount,
+                currency=final_currency,
+                usage_tokens=usage_tokens,
+                generate_audio=effective_generate_audio,
+            )
+        )
+        affected = rowcount(result)
+        if affected > 0:
+            await self.session.commit()
+        return affected
+
     async def finish_call(
         self,
         call_id: int,
@@ -115,6 +224,12 @@ class UsageRepository(BaseRepository):
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         quality: str | None = None,
+        image_input_tokens: int | None = None,
+        image_output_tokens: int | None = None,
+        text_input_tokens: int | None = None,
+        text_output_tokens: int | None = None,
+        cost_amount: float | None = None,
+        currency: str | None = None,
     ) -> None:
         finished_at = utc_now()
 
@@ -133,9 +248,9 @@ class UsageRepository(BaseRepository):
         except (ValueError, TypeError):
             duration_ms = 0
 
-        # Calculate cost (failed = 0)
-        cost_amount = 0.0
-        currency = row.currency or "USD"
+        # Calculate cost. Explicit cost input is treated as provider-reported billing data.
+        final_cost_amount = 0.0
+        final_currency = row.currency or "USD"
         effective_provider = row.provider or PROVIDER_GEMINI
 
         # Pre-query custom provider pricing (avoids sync-over-async in CostCalculator)
@@ -152,12 +267,25 @@ class UsageRepository(BaseRepository):
                 custom_price_output = price_model.price_output
                 custom_currency = price_model.currency
 
-        if status == "success":
-            cost_amount, currency = cost_calculator.calculate_cost(
+        # OpenAI 图片调用：input_tokens/output_tokens 列的"总和"语义
+        # = image_*_tokens + text_*_tokens（用于跨 call_type 聚合查询保持兼容）
+        has_image_tokens = any(
+            t is not None for t in (image_input_tokens, image_output_tokens, text_input_tokens, text_output_tokens)
+        )
+        if has_image_tokens:
+            input_tokens = (image_input_tokens or 0) + (text_input_tokens or 0)
+            output_tokens = (image_output_tokens or 0) + (text_output_tokens or 0)
+
+        if cost_amount is not None:
+            final_cost_amount = cost_amount
+            final_currency = currency or row.currency or "USD"
+        elif status == "success":
+            final_cost_amount, final_currency = cost_calculator.calculate_cost(
                 provider=effective_provider,
-                call_type=row.call_type,
+                call_type=row.call_type,  # type: ignore[arg-type]
                 model=row.model,
                 resolution=row.resolution,
+                aspect_ratio=row.aspect_ratio,
                 duration_seconds=row.duration_seconds,
                 generate_audio=bool(row.generate_audio),
                 usage_tokens=usage_tokens,
@@ -165,6 +293,10 @@ class UsageRepository(BaseRepository):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 quality=quality,
+                image_input_tokens=image_input_tokens,
+                image_output_tokens=image_output_tokens,
+                text_input_tokens=text_input_tokens,
+                text_output_tokens=text_output_tokens,
                 custom_price_input=custom_price_input,
                 custom_price_output=custom_price_output,
                 custom_currency=custom_currency,
@@ -180,11 +312,15 @@ class UsageRepository(BaseRepository):
                 finished_at=finished_at,
                 duration_ms=duration_ms,
                 retry_count=retry_count,
-                cost_amount=cost_amount,
-                currency=currency,
+                cost_amount=final_cost_amount,
+                currency=final_currency,
                 usage_tokens=usage_tokens,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                image_input_tokens=image_input_tokens,
+                image_output_tokens=image_output_tokens,
+                text_input_tokens=text_input_tokens,
+                text_output_tokens=text_output_tokens,
                 output_path=output_path,
                 error_message=error_truncated,
             )
@@ -236,9 +372,18 @@ class UsageRepository(BaseRepository):
         # Main aggregation query
         main_stmt = (
             select(
-                func.coalesce(func.sum(case((ApiCall.currency == "USD", ApiCall.cost_amount), else_=0)), 0).label(
-                    "total_cost_usd"
-                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                (ApiCall.status == "success") & (ApiCall.currency == "USD") & (ApiCall.cost_amount > 0),
+                                ApiCall.cost_amount,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("total_cost_usd"),
                 func.count(case((ApiCall.call_type == "image", 1))).label("image_count"),
                 func.count(case((ApiCall.call_type == "video", 1))).label("video_count"),
                 func.count(case((ApiCall.call_type == "text", 1))).label("text_count"),
@@ -251,14 +396,19 @@ class UsageRepository(BaseRepository):
         main_stmt = self._scope_query(main_stmt, ApiCall)
         row = (await self.session.execute(main_stmt)).one()
 
-        # Cost by currency
+        # Cost by currency mirrors project cost estimates: only successful billed calls count.
         currency_stmt = (
             select(
                 ApiCall.currency,
                 func.coalesce(func.sum(ApiCall.cost_amount), 0).label("total"),
             )
             .select_from(ApiCall)
-            .where(*filters)
+            .where(
+                *filters,
+                ApiCall.status == "success",
+                ApiCall.cost_amount > 0,
+                ApiCall.currency.isnot(None),
+            )
             .group_by(ApiCall.currency)
         )
         currency_stmt = self._scope_query(currency_stmt, ApiCall)
@@ -297,9 +447,18 @@ class UsageRepository(BaseRepository):
                 ApiCall.call_type,
                 func.count().label("total_calls"),
                 func.count(case((ApiCall.status == "success", 1))).label("success_calls"),
-                func.coalesce(func.sum(case((ApiCall.currency == "USD", ApiCall.cost_amount), else_=0)), 0).label(
-                    "total_cost_usd"
-                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                (ApiCall.status == "success") & (ApiCall.currency == "USD") & (ApiCall.cost_amount > 0),
+                                ApiCall.cost_amount,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("total_cost_usd"),
                 func.coalesce(func.sum(ApiCall.duration_ms), 0).label("total_duration_ms"),
             )
             .select_from(ApiCall)
@@ -310,6 +469,28 @@ class UsageRepository(BaseRepository):
         stmt = self._scope_query(stmt, ApiCall)
         rows = (await self.session.execute(stmt)).all()
 
+        currency_stmt = (
+            select(
+                ApiCall.provider,
+                ApiCall.call_type,
+                ApiCall.currency,
+                func.coalesce(func.sum(ApiCall.cost_amount), 0).label("total"),
+            )
+            .select_from(ApiCall)
+            .where(
+                *filters,
+                ApiCall.status == "success",
+                ApiCall.cost_amount > 0,
+                ApiCall.currency.isnot(None),
+            )
+            .group_by(ApiCall.provider, ApiCall.call_type, ApiCall.currency)
+        )
+        currency_stmt = self._scope_query(currency_stmt, ApiCall)
+        currency_rows = (await self.session.execute(currency_stmt)).all()
+        cost_by_group: dict[tuple[str | None, str | None], dict[str, float]] = {}
+        for provider_value, call_type_value, currency, total in currency_rows:
+            cost_by_group.setdefault((provider_value, call_type_value), {})[currency] = round(total, 4)
+
         stats = [
             {
                 "provider": row.provider,
@@ -317,6 +498,7 @@ class UsageRepository(BaseRepository):
                 "total_calls": row.total_calls,
                 "success_calls": row.success_calls,
                 "total_cost_usd": round(row.total_cost_usd, 4),
+                "cost_by_currency": cost_by_group.get((row.provider, row.call_type), {}),
                 "total_duration_seconds": round(row.total_duration_ms / 1000, 1) if row.total_duration_ms else 0,
             }
             for row in rows

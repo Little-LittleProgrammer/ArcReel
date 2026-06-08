@@ -7,13 +7,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 if TYPE_CHECKING:
     from server.services.jianying_draft_service import JianyingDraftService
@@ -26,9 +27,12 @@ from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
 
-from lib import PROJECT_ROOT
+from lib.app_data_dir import app_data_dir
 from lib.asset_fingerprints import compute_asset_fingerprints
+from lib.config.resolver import ConfigResolver
+from lib.db import async_session_factory
 from lib.i18n import Translator
+from lib.profile_manifest import ContentMode
 from lib.project_change_hints import project_change_source
 from lib.project_manager import ProjectManager
 from lib.status_calculator import StatusCalculator
@@ -39,11 +43,12 @@ from server.services.project_archive import (
     ProjectArchiveService,
     ProjectArchiveValidationError,
 )
+from server.services.project_cover import resolve_project_cover
 
 router = APIRouter()
 
 # 初始化项目管理器和状态计算器
-pm = ProjectManager(PROJECT_ROOT / "projects")
+pm = ProjectManager(app_data_dir())
 calc = StatusCalculator(pm)
 
 # episode 字段白名单：只允许持久化合法的 on-disk 字段。
@@ -68,7 +73,7 @@ class CreateProjectRequest(BaseModel):
     name: str | None = None
     title: str | None = None
     style: str | None = ""  # 保留但不再是用户入口
-    content_mode: str | None = "narration"
+    content_mode: ContentMode | None = "narration"
     aspect_ratio: str | None = "9:16"
     default_duration: int | None = None
     generation_mode: str | None = None
@@ -76,9 +81,12 @@ class CreateProjectRequest(BaseModel):
     style_template_id: str | None = None
     video_backend: str | None = None
     image_backend: str | None = None
+    image_provider_t2i: str | None = None
+    image_provider_i2i: str | None = None
     text_backend_script: str | None = None
     text_backend_overview: str | None = None
     text_backend_style: str | None = None
+    model_settings: dict[str, dict[str, str | None]] | None = None
 
 
 class EpisodePatch(BaseModel):
@@ -98,12 +106,14 @@ class EpisodePatch(BaseModel):
 class UpdateProjectRequest(BaseModel):
     title: str | None = None
     style: str | None = None
-    content_mode: str | None = None
+    content_mode: ContentMode | None = None
     aspect_ratio: str | None = None
     default_duration: int | None = None
     generation_mode: str | None = None
     video_backend: str | None = None
     image_backend: str | None = None
+    image_provider_t2i: str | None = None
+    image_provider_i2i: str | None = None
     video_generate_audio: bool | None = None
     text_backend_script: str | None = None
     text_backend_overview: str | None = None
@@ -111,6 +121,7 @@ class UpdateProjectRequest(BaseModel):
     style_template_id: str | None = None
     clear_style_image: bool | None = None
     episodes: list[EpisodePatch] | None = None
+    model_settings: dict[str, dict[str, str | None]] | None = None
 
 
 def _cleanup_temp_file(path: str) -> None:
@@ -353,22 +364,43 @@ async def list_projects(_user: CurrentUser):
                 # 尝试加载项目元数据
                 if manager.project_exists(name):
                     project = manager.load_project(name)
-                    # 获取缩略图（第一个分镜图）
-                    project_dir = manager.get_project_path(name)
-                    storyboards_dir = project_dir / "storyboards"
-                    thumbnail = None
-                    if storyboards_dir.exists():
-                        scene_images = sorted(storyboards_dir.glob("scene_*.png"))
-                        if scene_images:
-                            thumbnail = f"/api/v1/files/{name}/storyboards/{scene_images[0].name}"
+                    # 一次性预加载每集剧本，喂给 cover + status 两路下游，去除重复 JSON I/O。
+                    # key 为 episode['script_file'] 原值（match resolve_project_cover /
+                    # StatusCalculator 对 key 的期望）。任何一集加载失败都不影响列表：
+                    # 仅跳过入 map，下游消费者自然按"缺失"路径兜底。
+                    preloaded_scripts: dict[str, dict] = {}
+                    for ep in project.get("episodes") or []:
+                        script_file = ep.get("script_file")
+                        if not script_file:
+                            continue
+                        try:
+                            preloaded_scripts[script_file] = manager.load_script(name, script_file)
+                        except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError) as load_err:
+                            # 与 resolve_project_cover / StatusCalculator._load_episode_script
+                            # 对齐：I/O 缺失 + JSON/schema 解析失败 → 跳过此集，继续预加载其他集；
+                            # 非预期异常（RuntimeError/MemoryError 等）让其冒泡到外层 try，走 basic info 兜底行。
+                            logger.debug(
+                                "list_projects 预加载剧本失败 project=%s script=%s err=%s",
+                                name,
+                                script_file,
+                                load_err,
+                            )
+
+                    # 封面走 resolve_project_cover fallback 链：
+                    # video_thumbnail → storyboard_image → scene_sheet → character_sheet
+                    # —— 兼顾 reference / grid / storyboard 三种生成模式。
+                    thumbnail = resolve_project_cover(manager, name, project, preloaded_scripts=preloaded_scripts)
 
                     # 使用 StatusCalculator 计算进度（读时计算）
-                    status = calculator.calculate_project_status(name, project)
+                    status = calculator.calculate_project_status(name, project, preloaded_scripts=preloaded_scripts)
 
+                    raw_title = project.get("title")
                     projects.append(
                         {
                             "name": name,
-                            "title": project.get("title", name),
+                            # title 缺失/为 None/类型异常时统一归一为空串,前端 i18n
+                            # 兜底显示「未命名项目」,确保接口契约始终返回 str。
+                            "title": raw_title if isinstance(raw_title, str) else "",
                             "style": project.get("style", ""),
                             "style_template_id": project.get("style_template_id"),
                             "style_image": project.get("style_image"),
@@ -381,7 +413,7 @@ async def list_projects(_user: CurrentUser):
                     projects.append(
                         {
                             "name": name,
-                            "title": name,
+                            "title": "",
                             "style": "",
                             "thumbnail": None,
                             "status": {},
@@ -391,7 +423,7 @@ async def list_projects(_user: CurrentUser):
                 # 出错时返回基本信息
                 logger.warning("加载项目 '%s' 元数据失败: %s", name, e)
                 projects.append(
-                    {"name": name, "title": name, "style": "", "thumbnail": None, "status": {}, "error": str(e)}
+                    {"name": name, "title": "", "style": "", "thumbnail": None, "status": {}, "error": str(e)}
                 )
 
         return {"projects": projects}
@@ -425,10 +457,16 @@ async def create_project(
                     )
                 style_prompt = resolve_template_prompt(req.style_template_id)
 
+            # legacy image_backend 已退役（拆为 image_provider_t2i/i2i）；写路径直接拒绝，
+            # 避免迁移后再写时被解析链忽略、静默落到全局默认的另一供应商。
+            if req.image_backend:
+                raise HTTPException(status_code=400, detail=_t("deprecated_image_backend"))
+
             # 与 update 路径对称：校验所有 backend 字段
             for field_name in (
                 "video_backend",
-                "image_backend",
+                "image_provider_t2i",
+                "image_provider_i2i",
                 "text_backend_script",
                 "text_backend_overview",
                 "text_backend_style",
@@ -438,20 +476,26 @@ async def create_project(
                     validate_backend_value(value, field_name, _t)
 
             try:
-                manager.create_project(project_name)
+                manager.create_project(project_name, content_mode=req.content_mode or "narration")
             except FileExistsError:
                 raise HTTPException(status_code=400, detail=_t("project_exists", name=project_name))
             extras = {
                 field: value
                 for field in (
                     "video_backend",
-                    "image_backend",
+                    "image_provider_t2i",
+                    "image_provider_i2i",
                     "text_backend_script",
                     "text_backend_overview",
                     "text_backend_style",
                 )
                 if (value := getattr(req, field))
             }
+            if req.model_settings is not None:
+                extras["model_settings"] = req.model_settings
+            # generation_mode 并入 extras 一次性写入，避免 create 后再 load-save 的额外 RMW
+            if req.generation_mode is not None:
+                extras["generation_mode"] = req.generation_mode
             with project_change_source("webui"):
                 project = manager.create_project_metadata(
                     project_name,
@@ -463,9 +507,6 @@ async def create_project(
                     style_template_id=req.style_template_id,
                     extras=extras or None,
                 )
-                if req.generation_mode is not None:
-                    project["generation_mode"] = req.generation_mode
-                    manager.save_project(project_name, project)
             return {"success": True, "name": project_name, "project": project}
 
         return await asyncio.to_thread(_sync)
@@ -476,6 +517,30 @@ async def create_project(
     except Exception as e:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/projects/{name}/video-capabilities")
+async def get_video_capabilities(
+    name: str,
+    _user: CurrentUser,
+    _t: Translator,
+):
+    """解析当前项目视频模型能力 + 用户项目偏好。
+
+    三级模型选择（项目 > 系统设置 > 系统默认）后，读 model 的 `supported_durations`
+    并派生 `max_duration`；同时带回 `project.json.default_duration`（用户偏好）。
+    所有 generation_mode（storyboard/grid/reference_video）都可复用。
+    """
+    resolver = ConfigResolver(async_session_factory)
+    try:
+        return await resolver.video_capabilities(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=_t("project_not_found", name=name)) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_t("video_capabilities_unresolved", name=name, reason=str(exc)),
+        ) from exc
 
 
 @router.get("/projects/{name}")
@@ -542,109 +607,122 @@ async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUse
 
         def _sync():
             manager = get_project_manager()
-            project = manager.load_project(name)
-
             if req.content_mode is not None:
                 raise HTTPException(
                     status_code=400,
                     detail=_t("project_id_not_editable"),
                 )
 
-            if req.title is not None:
-                project["title"] = req.title
-            if req.style is not None:
-                project["style"] = req.style
-            for field in (
-                "video_backend",
-                "image_backend",
-                "text_backend_script",
-                "text_backend_overview",
-                "text_backend_style",
-            ):
-                if field in req.model_fields_set:
-                    value = getattr(req, field)
-                    if value:
-                        validate_backend_value(value, field, _t)
-                        project[field] = value
-                    else:
-                        project.pop(field, None)
-            if "video_generate_audio" in req.model_fields_set:
-                if req.video_generate_audio is None:
-                    project.pop("video_generate_audio", None)
-                else:
-                    project["video_generate_audio"] = req.video_generate_audio
-            if "aspect_ratio" in req.model_fields_set and req.aspect_ratio is not None:
-                project["aspect_ratio"] = req.aspect_ratio
-            if "generation_mode" in req.model_fields_set:
-                if req.generation_mode is None:
-                    project.pop("generation_mode", None)
-                else:
-                    project["generation_mode"] = req.generation_mode
-            if "default_duration" in req.model_fields_set:
-                if req.default_duration is None:
-                    project.pop("default_duration", None)
-                else:
-                    project["default_duration"] = req.default_duration
+            # legacy image_backend 已退役（拆为 image_provider_t2i/i2i）；写路径直接拒绝，
+            # 避免迁移后再写时被解析链忽略、静默落到全局默认的另一供应商。
+            if req.image_backend:
+                raise HTTPException(status_code=400, detail=_t("deprecated_image_backend"))
 
-            if "style_template_id" in req.model_fields_set:
-                if req.style_template_id is None:
-                    # 取消模版选择：同时清掉展开的 style prompt，避免遗留孤儿文本
-                    project.pop("style_template_id", None)
-                    project["style"] = ""
-                else:
-                    if not is_known_template(req.style_template_id):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=_t("unknown_style_template", template_id=req.style_template_id),
-                        )
-                    project["style_template_id"] = req.style_template_id
-                    project["style"] = resolve_template_prompt(req.style_template_id)
-                    # 强互斥:模版与参考图二选一
+            def _mutate(project: dict) -> None:
+                # 整段 read-modify-write 在单一 _project_lock 内完成，避免并发 PATCH / 任务回写丢更新
+                if req.title is not None:
+                    project["title"] = req.title
+                if req.style is not None:
+                    project["style"] = req.style
+                for field in (
+                    "video_backend",
+                    "image_provider_t2i",
+                    "image_provider_i2i",
+                    "text_backend_script",
+                    "text_backend_overview",
+                    "text_backend_style",
+                ):
+                    if field in req.model_fields_set:
+                        value = getattr(req, field)
+                        if value:
+                            validate_backend_value(value, field, _t)
+                            project[field] = value
+                        else:
+                            project.pop(field, None)
+
+                if "video_generate_audio" in req.model_fields_set:
+                    if req.video_generate_audio is None:
+                        project.pop("video_generate_audio", None)
+                    else:
+                        project["video_generate_audio"] = req.video_generate_audio
+                if "aspect_ratio" in req.model_fields_set and req.aspect_ratio is not None:
+                    project["aspect_ratio"] = req.aspect_ratio
+                if "generation_mode" in req.model_fields_set:
+                    if req.generation_mode is None:
+                        project.pop("generation_mode", None)
+                    else:
+                        project["generation_mode"] = req.generation_mode
+                if "default_duration" in req.model_fields_set:
+                    if req.default_duration is None:
+                        project.pop("default_duration", None)
+                    else:
+                        project["default_duration"] = req.default_duration
+
+                if "style_template_id" in req.model_fields_set:
+                    if req.style_template_id is None:
+                        # 取消模版选择：同时清掉展开的 style prompt，避免遗留孤儿文本
+                        project.pop("style_template_id", None)
+                        project["style"] = ""
+                    else:
+                        if not is_known_template(req.style_template_id):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=_t("unknown_style_template", template_id=req.style_template_id),
+                            )
+                        project["style_template_id"] = req.style_template_id
+                        project["style"] = resolve_template_prompt(req.style_template_id)
+                        # 强互斥:模版与参考图二选一
+                        project.pop("style_image", None)
+                        project.pop("style_description", None)
+
+                if req.clear_style_image:
+                    # 显式清除自定义参考图，用于"取消风格"流程
                     project.pop("style_image", None)
                     project.pop("style_description", None)
 
-            if req.clear_style_image:
-                # 显式清除自定义参考图，用于"取消风格"流程
-                project.pop("style_image", None)
-                project.pop("style_description", None)
+                if "model_settings" in req.model_fields_set:
+                    if req.model_settings is None:
+                        project.pop("model_settings", None)
+                    else:
+                        project["model_settings"] = req.model_settings
 
-            if "episodes" in req.model_fields_set and req.episodes is not None:
-                # 合并 episodes：保留现有 episode 的完整数据，仅更新请求中显式提供的字段。
-                # 使用 model_fields_set（而非 exclude_none）判断字段是否显式出现，使得
-                # `generation_mode: null` 可用于清空集级覆盖、回退到项目级模式继承。
-                # 白名单同时拦截 StatusCalculator 注入的计算字段（scenes_count / status
-                # / storyboards / videos 等），防止写回 project.json。
-                existing_list = project.get("episodes", [])
-                patch_map: dict[int, EpisodePatch] = {}
-                for ep in req.episodes:
-                    patch_map[ep.episode] = ep  # 重复编号：后者覆盖前者
+                if "episodes" in req.model_fields_set and req.episodes is not None:
+                    # 合并 episodes：保留现有 episode 的完整数据，仅更新请求中显式提供的字段。
+                    # 使用 model_fields_set（而非 exclude_none）判断字段是否显式出现，使得
+                    # `generation_mode: null` 可用于清空集级覆盖、回退到项目级模式继承。
+                    # 白名单同时拦截 StatusCalculator 注入的计算字段（scenes_count / status
+                    # / storyboards / videos 等），防止写回 project.json。
+                    existing_list = project.get("episodes", [])
+                    patch_map: dict[int, EpisodePatch] = {}
+                    for ep in req.episodes:
+                        patch_map[ep.episode] = ep  # 重复编号：后者覆盖前者
 
-                new_episodes: list[dict] = []
-                for existing_ep in existing_list:
-                    ep_num = existing_ep.get("episode")
-                    patch = patch_map.pop(ep_num, None)
-                    if patch is None:
-                        new_episodes.append(existing_ep)
-                        continue
-                    updated = dict(existing_ep)
-                    for field_name in EPISODE_PERSIST_FIELDS:
-                        if field_name not in patch.model_fields_set:
+                    new_episodes: list[dict] = []
+                    for existing_ep in existing_list:
+                        ep_num = existing_ep.get("episode")
+                        patch = patch_map.pop(ep_num, None)
+                        if patch is None:
+                            new_episodes.append(existing_ep)
                             continue
-                        value = getattr(patch, field_name)
-                        if value is None:
-                            updated.pop(field_name, None)
-                        else:
-                            updated[field_name] = value
-                    new_episodes.append(updated)
+                        updated = dict(existing_ep)
+                        for field_name in EPISODE_PERSIST_FIELDS:
+                            if field_name not in patch.model_fields_set:
+                                continue
+                            value = getattr(patch, field_name)
+                            if value is None:
+                                updated.pop(field_name, None)
+                            else:
+                                updated[field_name] = value
+                        new_episodes.append(updated)
 
-                for unknown_ep in patch_map:
-                    logger.warning("Skipping patch for unknown episode %s", unknown_ep)
+                    for unknown_ep in patch_map:
+                        logger.warning("Skipping patch for unknown episode %s", unknown_ep)
 
-                project["episodes"] = new_episodes
+                    project["episodes"] = new_episodes
 
             with project_change_source("webui"):
-                manager.save_project(name, project)
-            return {"success": True, "project": project}
+                # update_project 已在持锁窗口内统一应用迁移，返回升级后字段，无需二次 load_project
+                return {"success": True, "project": manager.update_project(name, _mutate)}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError:
@@ -696,47 +774,57 @@ class UpdateSceneRequest(BaseModel):
     updates: dict
 
 
-@router.patch("/projects/{name}/scenes/{scene_id}")
+@router.patch("/projects/{name}/script-scenes/{scene_id}")
 async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _user: CurrentUser, _t: Translator):
-    """更新场景"""
+    """更新 drama 模式剧本中的单个场景镜头（按 scene_id 定位）。
+
+    路径与项目场景资产 CRUD（``/projects/{name}/scenes/{entry_name}``）做明确区分，
+    避免 FastAPI 按注册顺序优先匹配本端点导致 SceneCard 保存请求被截获、Pydantic
+    必填字段校验返回双 "Field required"。
+    """
     try:
 
         def _sync():
             manager = get_project_manager()
-            script = manager.load_script(name, req.script_file)
 
-            # 找到并更新场景
-            scene_found = False
-            for scene in script.get("scenes", []):
-                if scene.get("scene_id") == scene_id:
-                    scene_found = True
-                    # 更新允许的字段
-                    for key, value in req.updates.items():
-                        if key in [
-                            "duration_seconds",
-                            "image_prompt",
-                            "video_prompt",
-                            "characters_in_scene",
-                            "scenes",
-                            "props",
-                            "segment_break",
-                            "note",
-                        ]:
-                            if value is None and key != "note":
-                                continue
-                            scene[key] = value
-                    break
-
-            if not scene_found:
-                raise HTTPException(status_code=404, detail=_t("scene_not_found", id=scene_id))
-
+            # 整段 RMW 在单一 _script_lock 内完成；未命中时在锁内 raise，跳过写回
+            matched_scene: dict[str, Any] | None = None
             with project_change_source("webui"):
-                manager.save_script(name, script, req.script_file)
-            return {"success": True, "scene": scene}
+                with manager.locked_script(name, req.script_file) as script:
+                    for scene in script.get("scenes", []):
+                        if scene.get("scene_id") == scene_id:
+                            matched_scene = scene
+                            # 更新允许的字段
+                            for key, value in req.updates.items():
+                                if key in [
+                                    "duration_seconds",
+                                    "image_prompt",
+                                    "video_prompt",
+                                    "characters_in_scene",
+                                    "scenes",
+                                    "props",
+                                    "segment_break",
+                                    "note",
+                                ]:
+                                    if value is None and key != "note":
+                                        continue
+                                    scene[key] = value
+                            break
+
+                    if matched_scene is None:
+                        raise HTTPException(status_code=404, detail=_t("scene_not_found", id=scene_id))
+            return {"success": True, "scene": matched_scene}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=_t("script_not_found", name=req.script_file))
+    except ValueError as exc:
+        # 结构校验失败、集号错配、非法文件名都抛 ValueError（ScriptStructureValidationError
+        # 即其子类）：统一转 422 客户端错误，避免落到下面的 500 兜底。
+        raise HTTPException(
+            status_code=422,
+            detail=_t("script_validation_failed", details=str(exc)),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -752,6 +840,9 @@ class UpdateSegmentRequest(BaseModel):
     video_prompt: dict | str | None = None
     transition_to_next: str | None = None
     note: str | None = None
+    characters_in_segment: list[str] | None = None
+    scenes: list[str] | None = None
+    props: list[str] | None = None
 
 
 class UpdateOverviewRequest(BaseModel):
@@ -768,41 +859,50 @@ async def update_segment(name: str, segment_id: str, req: UpdateSegmentRequest, 
 
         def _sync():
             manager = get_project_manager()
-            script = manager.load_script(name, req.script_file)
 
-            # 检查是否为说书模式
-            if script.get("content_mode") != "narration" and "segments" not in script:
-                raise HTTPException(status_code=400, detail=_t("narration_mode_required"))
-
-            # 找到并更新片段
-            segment_found = False
-            for segment in script.get("segments", []):
-                if segment.get("segment_id") == segment_id:
-                    segment_found = True
-                    if req.duration_seconds is not None:
-                        segment["duration_seconds"] = req.duration_seconds
-                    if req.segment_break is not None:
-                        segment["segment_break"] = req.segment_break
-                    if req.image_prompt is not None:
-                        segment["image_prompt"] = req.image_prompt
-                    if req.video_prompt is not None:
-                        segment["video_prompt"] = req.video_prompt
-                    if req.transition_to_next is not None:
-                        segment["transition_to_next"] = req.transition_to_next
-                    if "note" in req.model_fields_set:
-                        segment["note"] = req.note
-                    break
-
-            if not segment_found:
-                raise HTTPException(status_code=404, detail=_t("segment_not_found", id=segment_id))
-
+            # 整段 RMW 在单一 _script_lock 内完成；模式不符 / 未命中时在锁内 raise，跳过写回
+            matched_segment: dict[str, Any] | None = None
             with project_change_source("webui"):
-                manager.save_script(name, script, req.script_file)
-            return {"success": True, "segment": segment}
+                with manager.locked_script(name, req.script_file) as script:
+                    # 检查是否为说书模式：仅 narration 且含 segments 键才放行；
+                    # drama 脚本即使残留 segments 键也拒绝，避免被当 narration 改写
+                    if script.get("content_mode") != "narration" or "segments" not in script:
+                        raise HTTPException(status_code=400, detail=_t("narration_mode_required"))
+
+                    for segment in script.get("segments", []):
+                        if segment.get("segment_id") == segment_id:
+                            matched_segment = segment
+                            if req.duration_seconds is not None:
+                                segment["duration_seconds"] = req.duration_seconds
+                            if req.segment_break is not None:
+                                segment["segment_break"] = req.segment_break
+                            if req.image_prompt is not None:
+                                segment["image_prompt"] = req.image_prompt
+                            if req.video_prompt is not None:
+                                segment["video_prompt"] = req.video_prompt
+                            if req.transition_to_next is not None:
+                                segment["transition_to_next"] = req.transition_to_next
+                            if "note" in req.model_fields_set:
+                                segment["note"] = req.note
+                            for field in ("characters_in_segment", "scenes", "props"):
+                                if field in req.model_fields_set:
+                                    segment[field] = getattr(req, field) or []
+                            break
+
+                    if matched_segment is None:
+                        raise HTTPException(status_code=404, detail=_t("segment_not_found", id=segment_id))
+            return {"success": True, "segment": matched_segment}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=_t("script_not_found", name=req.script_file))
+    except ValueError as exc:
+        # 结构校验失败、集号错配、非法文件名都抛 ValueError（ScriptStructureValidationError
+        # 即其子类）：统一转 422 客户端错误，避免落到下面的 500 兜底。
+        raise HTTPException(
+            status_code=422,
+            detail=_t("script_validation_failed", details=str(exc)),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -843,6 +943,7 @@ async def set_project_source(
 
         # 异步读取上传文件
         raw: bytes | None = None
+        original_name: str = "novel.txt"
         if file:
             original_name = file.filename or "novel.txt"
             suffix = Path(original_name).suffix.lower()
@@ -851,6 +952,7 @@ async def set_project_source(
             if file.size is not None and file.size > MAX_CHARS * 4:
                 raise HTTPException(status_code=400, detail=_t("file_too_large", max_chars=MAX_CHARS))
             raw = await file.read()
+        text_content: str = content or ""
 
         # 同步文件 I/O 在线程中执行
         def _sync_write():
@@ -871,11 +973,11 @@ async def set_project_source(
                 (source_dir / safe_filename).write_text(text, encoding="utf-8")
                 return safe_filename, len(text)
             else:
-                if len(content) > MAX_CHARS:
+                if len(text_content) > MAX_CHARS:
                     raise HTTPException(status_code=400, detail=_t("file_too_large", max_chars=MAX_CHARS))
                 safe_filename = "novel.txt"
-                (source_dir / safe_filename).write_text(content, encoding="utf-8")
-                return safe_filename, len(content)
+                (source_dir / safe_filename).write_text(text_content, encoding="utf-8")
+                return safe_filename, len(text_content)
 
         safe_filename, chars = await asyncio.to_thread(_sync_write)
 
@@ -929,23 +1031,25 @@ async def update_overview(name: str, req: UpdateOverviewRequest, _user: CurrentU
 
         def _sync():
             manager = get_project_manager()
-            project = manager.load_project(name)
+            captured: dict[str, Any] = {}
 
-            if "overview" not in project:
-                project["overview"] = {}
-
-            if req.synopsis is not None:
-                project["overview"]["synopsis"] = req.synopsis
-            if req.genre is not None:
-                project["overview"]["genre"] = req.genre
-            if req.theme is not None:
-                project["overview"]["theme"] = req.theme
-            if req.world_setting is not None:
-                project["overview"]["world_setting"] = req.world_setting
+            def _mutate(project: dict) -> None:
+                # 整段 RMW 在单一 _project_lock 内完成，避免与并发生成的 overview 回写互相覆盖
+                if "overview" not in project:
+                    project["overview"] = {}
+                if req.synopsis is not None:
+                    project["overview"]["synopsis"] = req.synopsis
+                if req.genre is not None:
+                    project["overview"]["genre"] = req.genre
+                if req.theme is not None:
+                    project["overview"]["theme"] = req.theme
+                if req.world_setting is not None:
+                    project["overview"]["world_setting"] = req.world_setting
+                captured["overview"] = project["overview"]
 
             with project_change_source("webui"):
-                manager.save_project(name, project)
-            return {"success": True, "overview": project["overview"]}
+                manager.update_project(name, _mutate)
+            return {"success": True, "overview": captured["overview"]}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError:

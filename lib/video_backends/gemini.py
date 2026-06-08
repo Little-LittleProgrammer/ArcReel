@@ -5,22 +5,24 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 from lib.config.url_utils import normalize_base_url
-from lib.gemini_shared import VERTEX_SCOPES, RateLimiter, get_shared_rate_limiter
+from lib.gemini_shared import VERTEX_SCOPES, RateLimiter, get_shared_rate_limiter, resolve_gemini_api_key
+from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GEMINI
 from lib.retry import DOWNLOAD_BACKOFF_SECONDS, DOWNLOAD_MAX_ATTEMPTS, with_retry_async
 from lib.system_config import resolve_vertex_credentials_path
 from lib.video_backends.base import (
+    ResumeExpiredError,
     VideoCapabilities,
     VideoCapability,
     VideoGenerationRequest,
     VideoGenerationResult,
+    persist_provider_job_id,
     poll_with_retry,
 )
 
@@ -50,18 +52,18 @@ class GeminiVideoBackend:
 
         from lib.cost_calculator import cost_calculator
 
-        self._video_model = video_model or os.environ.get("GEMINI_VIDEO_MODEL", cost_calculator.DEFAULT_VIDEO_MODEL)
+        self._video_model = video_model or cost_calculator.DEFAULT_VIDEO_MODEL
 
         if self._backend_type == "vertex":
             import json as json_module
 
             from google.oauth2 import service_account
 
-            credentials_file = resolve_vertex_credentials_path(Path(__file__).parent.parent.parent)
+            credentials_file = resolve_vertex_credentials_path()
             if credentials_file is None:
                 raise ValueError("未找到 Vertex AI 凭证文件")
 
-            with open(credentials_file) as f:
+            with open(credentials_file, encoding="utf-8") as f:
                 creds_data = json_module.load(f)
             self._project_id = creds_data.get("project_id")
 
@@ -76,13 +78,10 @@ class GeminiVideoBackend:
                 credentials=self._credentials,
             )
         else:
-            _api_key = api_key or os.environ.get("GEMINI_API_KEY")
-            if not _api_key:
-                raise ValueError("GEMINI_API_KEY 环境变量未设置")
-
-            effective_base_url = normalize_base_url(base_url or os.environ.get("GEMINI_BASE_URL"))
+            api_key = resolve_gemini_api_key(api_key)
+            effective_base_url = normalize_base_url(base_url)
             http_options = {"base_url": effective_base_url} if effective_base_url else None
-            self._client = _genai.Client(api_key=_api_key, http_options=http_options)
+            self._client = _genai.Client(api_key=api_key, http_options=http_options)  # type: ignore[arg-type]
 
         # 缓存 capabilities，避免每次访问创建新 set
         self._capabilities: set[VideoCapability] = {
@@ -110,19 +109,40 @@ class GeminiVideoBackend:
     def video_capabilities(self) -> VideoCapabilities:
         return VideoCapabilities(last_frame=True, reference_images=True, max_reference_images=3)
 
-    @staticmethod
-    def _normalize_duration(duration_seconds: int) -> str:
-        """标准化为 Veo 支持的离散时长值: '4', '6', '8'。"""
-        if duration_seconds <= 4:
-            return "4"
-        if duration_seconds <= 6:
-            return "6"
-        return "8"
-
     async def generate(self, request: VideoGenerationRequest) -> VideoGenerationResult:
         """生成视频。任务创建和轮询阶段分离重试，避免瞬态错误导致重建任务。"""
         operation = await self._create_task(request)
+        op_name = getattr(operation, "name", None)
+        if not op_name:
+            # fail-fast：缺 operation.name 意味着 submit 成功但无法持久化 provider_job_id，
+            # 一旦进程中断，孤儿处理会走 [restart_lost] 回退到重新提交路径——这正是要避免的
+            # 重复扣费场景。直接抛错让 worker finally 标 failed，比静默继续 poll 安全。
+            raise RuntimeError("Gemini 提交成功但未返回 operation.name，无法持久化 provider_job_id")
+        if request.task_id is not None:
+            await persist_provider_job_id(request.task_id, op_name, provider=PROVIDER_GEMINI)
         return await self._poll_until_done(operation, request)
+
+    async def resume_video(self, job_id: str, request: VideoGenerationRequest) -> VideoGenerationResult:
+        """接续已 submit 的 Gemini operation：用 name 重建 GenerateVideosOperation 走 poll + 下载。
+
+        Operation 是 ABC，不可实例化；具体 LRO 子类 GenerateVideosOperation 通过
+        Pydantic v2 ``model_validate`` 接收 dict 构造（pyright 对 Pydantic 多继承的
+        字段推断不全，用 model_validate 绕开）。
+
+        NOT_FOUND 既可能在初次 ``operations.get`` 抛，也可能在 ``_poll_until_done`` 内
+        mid-poll 抛（远端 GC 了 LRO）。两处都需要归类为 ResumeExpiredError 让 worker
+        finally 走 ``[resume_expired]``——下面的 try/except 把整段包住。
+        """
+        op = self._types.GenerateVideosOperation.model_validate({"name": job_id, "done": False})
+        try:
+            refreshed = await self._client.aio.operations.get(op)
+            return await self._poll_until_done(refreshed, request)
+        except ResumeExpiredError:
+            raise
+        except Exception as exc:
+            if _is_gemini_not_found(exc):
+                raise ResumeExpiredError(job_id=job_id, provider=PROVIDER_GEMINI) from exc
+            raise
 
     @with_retry_async()
     async def _create_task(self, request: VideoGenerationRequest) -> Any:
@@ -131,16 +151,18 @@ class GeminiVideoBackend:
         if self._rate_limiter:
             await self._rate_limiter.acquire_async(self._video_model)
 
-        # 2. duration 标准化为 Veo 支持的离散值并转字符串
-        duration_str = self._normalize_duration(request.duration_seconds)
+        # 2. duration 透传（由模型 supported_durations 校验，不在 backend 做桶映射）
+        duration_str = str(request.duration_seconds)
 
         # 3. 构建配置
+        # 反向提示词不再走参数通道——caller 在 request.prompt 末尾文本化注入
+        # （prompt_builders.append_video_negative_tail），跨 backend 一致。
         config_params: dict = {
             "aspect_ratio": request.aspect_ratio,
-            "resolution": request.resolution,
             "duration_seconds": duration_str,
-            "negative_prompt": request.negative_prompt or "music, BGM, background music, subtitles, low quality",
         }
+        if request.resolution is not None:
+            config_params["resolution"] = request.resolution
         if self._backend_type == "vertex":
             config_params["generate_audio"] = request.generate_audio
 
@@ -170,6 +192,19 @@ class GeminiVideoBackend:
         source = self._types.GenerateVideosSource(prompt=request.prompt, image=image_param)
 
         # 5. 调用 API
+        logger.info(
+            "调用 %s 视频 SDK payload=%s",
+            self.name,
+            format_kwargs_for_log(
+                {
+                    "model": self._video_model,
+                    "prompt": request.prompt,
+                    "config": config_params,
+                    "has_start_image": request.start_image is not None,
+                    "reference_image_count": len(request.reference_images) if request.reference_images else 0,
+                }
+            ),
+        )
         operation = await self._client.aio.models.generate_videos(model=self._video_model, source=source, config=config)
         op_name = getattr(operation, "name", "unknown")
         logger.info("视频生成已提交, operation=%s", op_name)
@@ -280,3 +315,24 @@ class GeminiVideoBackend:
             # AI Studio 模式：使用 files.download
             self._client.files.download(file=video_ref)
             video_ref.save(str(output_path))
+
+
+def _is_gemini_not_found(exc: BaseException) -> bool:
+    """识别 Gemini operations.get 「operation 不存在 / 已过期」响应。
+
+    INVALID_ARGUMENT 不归过期：Gemini 用它表达入参不合法（如非法 operation 格式），
+    与 NOT_FOUND（资源不存在）语义不同；归过期会把客户端 bug 当成幽灵任务静默吞掉。
+    """
+    try:
+        from google.genai import errors as _genai_errors  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        _genai_errors = None
+
+    if _genai_errors is not None:
+        not_found_cls = getattr(_genai_errors, "ClientError", None) or getattr(_genai_errors, "APIError", None)
+        if not_found_cls is not None and isinstance(exc, not_found_cls):
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            if code in (404, "404", "NOT_FOUND"):
+                return True
+    msg = str(exc).lower()
+    return "not found" in msg or "expired" in msg

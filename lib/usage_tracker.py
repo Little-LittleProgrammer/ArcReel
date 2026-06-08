@@ -52,6 +52,29 @@ class UsageTracker:
                 segment_id=segment_id,
             )
 
+    async def finalize_pending_by_call_id(
+        self,
+        *,
+        call_id: int,
+        cost_amount: float | None = None,
+        currency: str | None = None,
+        status: str = "success",
+        service_tier: str = "default",
+        usage_tokens: int | None = None,
+        generate_audio: bool | None = None,
+    ) -> int:
+        async with self._session_factory() as session:
+            repo = UsageRepository(session)
+            return await repo.finalize_pending_by_call_id(
+                call_id=call_id,
+                cost_amount=cost_amount,
+                currency=currency,
+                status=status,
+                service_tier=service_tier,
+                usage_tokens=usage_tokens,
+                generate_audio=generate_audio,
+            )
+
     async def finish_call(
         self,
         call_id: int,
@@ -65,6 +88,12 @@ class UsageTracker:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         quality: str | None = None,
+        image_input_tokens: int | None = None,
+        image_output_tokens: int | None = None,
+        text_input_tokens: int | None = None,
+        text_output_tokens: int | None = None,
+        cost_amount: float | None = None,
+        currency: str | None = None,
     ) -> None:
 
         async with self._session_factory() as session:
@@ -81,6 +110,12 @@ class UsageTracker:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 quality=quality,
+                image_input_tokens=image_input_tokens,
+                image_output_tokens=image_output_tokens,
+                text_input_tokens=text_input_tokens,
+                text_output_tokens=text_output_tokens,
+                cost_amount=cost_amount,
+                currency=currency,
             )
 
     async def get_stats(

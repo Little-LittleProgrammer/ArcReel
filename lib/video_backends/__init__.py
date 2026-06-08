@@ -1,6 +1,13 @@
 """视频生成服务层公共 API。"""
 
-from lib.providers import PROVIDER_ARK, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_NEWAPI, PROVIDER_OPENAI, PROVIDER_BAILIAN
+from lib.providers import (
+    PROVIDER_ARK,
+    PROVIDER_ARK_AGENT_PLAN,
+    PROVIDER_GEMINI,
+    PROVIDER_GROK,
+    PROVIDER_NEWAPI,
+    PROVIDER_OPENAI,
+)
 from lib.video_backends.base import (
     VideoBackend,
     VideoCapability,
@@ -15,7 +22,6 @@ __all__ = [
     "PROVIDER_GROK",
     "PROVIDER_NEWAPI",
     "PROVIDER_OPENAI",
-    "PROVIDER_BAILIAN",
     "VideoBackend",
     "VideoCapability",
     "VideoGenerationRequest",
@@ -35,6 +41,7 @@ register_backend(PROVIDER_GEMINI, GeminiVideoBackend)
 from lib.video_backends.ark import ArkVideoBackend
 
 register_backend(PROVIDER_ARK, ArkVideoBackend)
+register_backend(PROVIDER_ARK_AGENT_PLAN, ArkVideoBackend)
 
 # Grok: xai-sdk
 from lib.video_backends.grok import GrokVideoBackend
@@ -51,7 +58,14 @@ from lib.video_backends.newapi import NewAPIVideoBackend
 
 register_backend(PROVIDER_NEWAPI, NewAPIVideoBackend)
 
-# Bailian
-from lib.video_backends.bailian import BailianVideoBackend
+# fork: Vidu — 单独 import 以避免与上游聚合 import 冲突
+from lib.providers import PROVIDER_VIDU  # noqa: E402
+from lib.video_backends.vidu import ViduVideoBackend  # noqa: E402
 
-register_backend(PROVIDER_BAILIAN, BailianVideoBackend)
+register_backend(PROVIDER_VIDU, ViduVideoBackend)
+
+# 阿里百炼 DashScope — HappyHorse / 万相视频
+from lib.providers import PROVIDER_DASHSCOPE  # noqa: E402
+from lib.video_backends.dashscope import DashScopeVideoBackend  # noqa: E402
+
+register_backend(PROVIDER_DASHSCOPE, DashScopeVideoBackend)

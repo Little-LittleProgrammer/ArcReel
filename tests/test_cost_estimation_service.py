@@ -239,6 +239,53 @@ class TestCostEstimationService:
         # 旧 key 不应出现
         assert "character_and_clue" not in actual
 
+    async def test_dirty_script_skipped_with_warning(self, db_factory, caplog):
+        """单集脏脚本(segments=null)不应让整个项目费用估算 5xx;脏集降级为 0 segments
+        + warning,其他正常集仍参与估算。"""
+        import logging
+
+        resolver = ConfigResolver(db_factory)
+        tracker = UsageTracker(session_factory=db_factory)
+        service = CostEstimationService(resolver, tracker)
+
+        project_data = {
+            "title": "Test",
+            "content_mode": "narration",
+            "episodes": [
+                {"episode": 1, "title": "Ep1", "script_file": "ep1.json"},
+                {"episode": 2, "title": "Ep2-dirty", "script_file": "ep2.json"},
+                {"episode": 3, "title": "Ep3", "script_file": "ep3.json"},
+            ],
+        }
+        # ep2 segments 是 null(脏数据)→ get_storyboard_items 抛 ScriptEditError
+        dirty_script = {
+            "episode": 2,
+            "title": "Dirty",
+            "content_mode": "narration",
+            "summary": "t",
+            "novel": {"title": "t", "chapter": "c"},
+            "segments": None,  # 脏数据
+        }
+        scripts = {
+            "ep1.json": _make_script(1, ["E1S001"], [6]),
+            "ep2.json": dirty_script,
+            "ep3.json": _make_script(3, ["E3S001"], [8]),
+        }
+
+        with caplog.at_level(logging.WARNING, logger="server.services.cost_estimation"):
+            result = await service.compute(project_data, scripts, project_name="test")
+
+        # 正常集 ep1 / ep3 都参与估算,脏集 ep2 仍出现但 segments 为空
+        assert len(result["episodes"]) == 3
+        eps_by_episode = {ep["episode"]: ep for ep in result["episodes"]}
+        assert len(eps_by_episode[1]["segments"]) == 1
+        assert len(eps_by_episode[2]["segments"]) == 0
+        assert len(eps_by_episode[3]["segments"]) == 1
+
+        # warning 显式标出哪一集被跳过
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("ep2.json" in m for m in warnings), warnings
+
     async def test_empty_episodes(self, db_factory):
         resolver = ConfigResolver(db_factory)
         tracker = UsageTracker(session_factory=db_factory)
@@ -250,3 +297,48 @@ class TestCostEstimationService:
 
         assert result["episodes"] == []
         assert result["project_totals"]["estimate"] == {}
+
+    async def test_cost_estimation_uses_t2i_default_when_split_fields_present(self, db_factory):
+        """project 仅有 image_provider_t2i 时，cost estimation 用此值估算（T2I 是 cost estimation 锚点）。"""
+        resolver = ConfigResolver(db_factory)
+        tracker = UsageTracker(session_factory=db_factory)
+        service = CostEstimationService(resolver, tracker)
+
+        project_data = {
+            "title": "Test",
+            "content_mode": "narration",
+            "image_provider_t2i": "openai/gpt-image-1",
+            "image_provider_i2i": "openai/gpt-image-1-edit",
+            "episodes": [],
+        }
+
+        result = await service.compute(project_data, {}, project_name="test_split")
+
+        # T2I field should be the canonical image cost estimation anchor
+        assert result["models"]["image"]["provider"] == "openai"
+        assert result["models"]["image"]["model"] == "gpt-image-1"
+
+    async def test_cost_estimation_no_image_provider_falls_back_to_resolver(self, db_factory):
+        """project 没有 image_provider_t2i 时，cost_estimation 不再自行 fallback I2I 或 legacy
+        （legacy 由 ProjectManager.load_project 的 lazy upgrade 处理；I2I 和 T2I 是正交能力槽，
+        互替会算到错误价目）。无 T2I 字段则使用 resolver 默认值。"""
+        resolver = ConfigResolver(db_factory)
+        tracker = UsageTracker(session_factory=db_factory)
+        service = CostEstimationService(resolver, tracker)
+
+        project_data = {
+            "title": "Test",
+            "content_mode": "narration",
+            # 仅有 i2i 与 legacy 字段：cost_estimation 应忽略，落到 resolver 默认值
+            "image_provider_i2i": "openai/gpt-image-1-edit",
+            "image_backend": "gemini/gemini-2.0-flash-preview-image-generation",
+            "episodes": [],
+        }
+
+        result = await service.compute(project_data, {}, project_name="test_no_t2i")
+
+        # 正向锁定：项目无 T2I 字段时走 resolver；空 DB 没有任何 image provider，
+        # cost_estimation 走 except 分支返回 ("unknown", "unknown")。
+        # 这个契约同时排除掉 i2i 槽（gpt-image-1-edit）和 legacy（gemini-2.0-...）。
+        assert result["models"]["image"]["provider"] == "unknown"
+        assert result["models"]["image"]["model"] == "unknown"

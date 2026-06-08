@@ -29,6 +29,8 @@ function makeTask(overrides: Partial<TaskItem> = {}): TaskItem {
     result: null,
     error_message: null,
     cancelled_by: null,
+    provider_id: null,
+    provider_job_id: null,
     source: "webui",
     queued_at: "2026-02-01T00:00:00Z",
     started_at: null,
@@ -70,17 +72,30 @@ describe("stores", () => {
     app.setAssistantToolActivitySuppressed(true);
     expect(useAppStore.getState().assistantToolActivitySuppressed).toBe(true);
 
+    // pushToast 只写 toast，不再副作用写入 workspaceNotifications（issue #351 根因回归）
     app.pushToast("hello");
     expect(useAppStore.getState().toast?.text).toBe("hello");
     expect(useAppStore.getState().toast?.tone).toBe("info");
+    expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
+    app.clearToast();
+    expect(useAppStore.getState().toast).toBeNull();
+
+    // pushNotification 同时写两者，tone 与 target 正确传递
+    app.pushNotification("task failed", "error", {
+      target: { type: "segment", id: "S1", route: "/episodes/1" },
+    });
+    expect(useAppStore.getState().toast).toEqual(
+      expect.objectContaining({ text: "task failed", tone: "error" }),
+    );
     expect(useAppStore.getState().workspaceNotifications[0]).toEqual(
       expect.objectContaining({
-        text: "hello",
-        tone: "info",
+        text: "task failed",
+        tone: "error",
+        target: expect.objectContaining({ id: "S1" }),
       }),
     );
     app.clearToast();
-    expect(useAppStore.getState().toast).toBeNull();
+    useAppStore.setState({ workspaceNotifications: [] });
 
     app.pushWorkspaceNotification({
       text: "AI 刚更新了角色「hero」，点击查看",
@@ -90,6 +105,7 @@ describe("stores", () => {
         route: "/characters",
       },
     });
+    expect(useAppStore.getState().toast).toBeNull();
     const notification = useAppStore.getState().workspaceNotifications[0];
     expect(notification.target?.id).toBe("hero");
     app.markWorkspaceNotificationRead(notification.id);
@@ -140,7 +156,7 @@ describe("stores", () => {
     expect(useTasksStore.getState().tasks).toHaveLength(2);
     expect(useTasksStore.getState().tasks[0].task_id).toBe("task-2");
 
-    tasks.setStats({ queued: 1, running: 1, succeeded: 0, failed: 0, cancelled: 0, total: 2 });
+    tasks.setStats({ queued: 1, running: 1, cancelling: 0, succeeded: 0, failed: 0, cancelled: 0, total: 2 });
     expect(useTasksStore.getState().stats.total).toBe(2);
 
     tasks.setConnected(true);
@@ -278,6 +294,7 @@ describe("stores", () => {
           error_message: null,
           started_at: "2026-02-01T00:00:00Z",
           created_at: "2026-02-01T00:00:00Z",
+          usage_tokens: null,
           input_tokens: null,
           output_tokens: null,
         },

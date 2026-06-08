@@ -5,6 +5,7 @@ import { API } from "@/api";
 import { AssetFormModal } from "./AssetFormModal";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
+import { errMsg } from "@/utils/async";
 import type { Asset, AssetType } from "@/types/asset";
 
 interface Props {
@@ -56,21 +57,22 @@ export function AddToLibraryButton({
       });
       useAppStore.getState().pushToast(t("add_to_library_success", { name: payload.name }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast((err as Error).message, "error");
+      useAppStore.getState().pushToast(errMsg(err), "error");
       throw err;
     }
   };
 
   const defaultClass = showLabel
-    ? "inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
-    : "inline-flex items-center justify-center h-6 w-6 rounded text-gray-500 hover:bg-gray-800 hover:text-indigo-300 transition-colors";
+    ? "focus-ring inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors hover:bg-[oklch(1_0_0_/_0.05)]"
+    : "focus-ring inline-flex items-center justify-center h-6 w-6 rounded transition-colors hover:bg-[oklch(1_0_0_/_0.05)]";
 
   return (
     <>
       <button type="button" onClick={() => void openPreview()}
         aria-label={t("add_to_library")}
         title={t("add_to_library")}
-        className={className ?? defaultClass}>
+        className={className ?? defaultClass}
+        style={className ? undefined : { color: "var(--color-text-3)" }}>
         <Package className="h-3 w-3" />
         {showLabel && <span>{t("add_to_library_short")}</span>}
       </button>

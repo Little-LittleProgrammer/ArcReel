@@ -25,17 +25,24 @@ class StatusCalculator:
 
     @classmethod
     def _select_content_mode_and_items(cls, script: dict) -> tuple[str, list[dict]]:
+        """返回 ``(分派标签, items)``。
+
+        分派标签 ``"narration" | "drama" | "reference_video"`` 给下游分派使用：
+        ``generation_mode == "reference_video"`` 优先；否则按 content_mode 选 segments
+        或 scenes；都缺失时按主结构鸭子类型兜底（兼容老脚本未写 content_mode 的情况）。
+        参考视频集判定不再回退到 ``content_mode == "reference_video"``——新数据
+        已不可能产生该值。
+        """
         content_mode = script.get("content_mode")
-        if content_mode == "reference_video" and isinstance(script.get("video_units"), list):
-            return "reference_video", script.get("video_units", [])
+        generation_mode = script.get("generation_mode")
+        if generation_mode == "reference_video":
+            return "reference_video", script.get("video_units") or []
         if content_mode in {"narration", "drama"}:
             if content_mode == "narration" and isinstance(script.get("segments"), list):
                 return "narration", script.get("segments", [])
             if content_mode == "drama" and isinstance(script.get("scenes"), list):
                 return "drama", script.get("scenes", [])
 
-        if isinstance(script.get("video_units"), list):
-            return "reference_video", script.get("video_units", [])
         if isinstance(script.get("segments"), list):
             return "narration", script.get("segments", [])
         if isinstance(script.get("scenes"), list):
@@ -106,11 +113,22 @@ class StatusCalculator:
             return False
 
     def _load_episode_script(
-        self, project_name: str, episode_num: int, script_file: str, *, content_mode: str = "narration"
+        self,
+        project_name: str,
+        episode_num: int,
+        script_file: str,
+        *,
+        content_mode: str = "narration",
+        preloaded_scripts: dict[str, dict] | None = None,
     ) -> tuple:
         """加载单集剧本，返回 (script_status, script|None)，避免重复读取文件。
         script_status: 'generated' | 'segmented' | 'none'
+
+        若 ``preloaded_scripts`` 提供且 ``script_file`` 命中其 key，则直接复用预加载
+        结果，跳过一次 JSON 解析。缺失时回退到 ``pm.load_script``，保持原兜底语义。
         """
+        if preloaded_scripts is not None and script_file in preloaded_scripts:
+            return "generated", preloaded_scripts[script_file]
         try:
             script = self.pm.load_script(project_name, script_file)
             return "generated", script
@@ -132,20 +150,47 @@ class StatusCalculator:
             )
             return "generated", None
 
-    def calculate_current_phase(self, project: dict, episodes_stats: list[dict]) -> str:
-        """根据项目和集状态推断当前阶段"""
-        if not project.get("overview"):
-            return "setup"
-        if not episodes_stats:
-            return "worldbuilding"
-        any_generated = any(s["script_status"] == "generated" for s in episodes_stats)
-        all_generated = all(s["script_status"] == "generated" for s in episodes_stats)
-        if not any_generated:
-            return "worldbuilding"
-        if not all_generated:
+    def calculate_current_phase(
+        self,
+        project: dict,
+        episodes_stats: list[dict],
+        *,
+        assets_completed: int = 0,
+    ) -> str:
+        """根据项目和集状态推断当前阶段（按实际产物倒序判定）。
+
+        判定顺序（高优先级在前）：
+        1. 已有任意一集脚本生成 → ``scripting`` / ``production`` / ``completed``
+        2. 已有任意分段草稿、资产设计图（character/scene/prop sheet）或 overview
+           → ``worldbuilding``
+        3. 其它（全新项目）→ ``setup``
+
+        这避免了「用户跳过 overview 直接做剧本/分镜/视频，阶段却卡在 setup」
+        的体验问题——overview 只是 worldbuilding 的一种入口信号，而不是
+        离开 setup 的必经门票。
+        """
+        any_generated = False
+        all_generated = bool(episodes_stats)
+        any_segmented = False
+        all_completed = bool(episodes_stats)
+        for s in episodes_stats:
+            script_status = s["script_status"]
+            if script_status == "generated":
+                any_generated = True
+            else:
+                all_generated = False
+                if script_status == "segmented":
+                    any_segmented = True
+            if s.get("status") != "completed":
+                all_completed = False
+
+        if all_generated:
+            return "completed" if all_completed else "production"
+        if any_generated:
             return "scripting"
-        all_completed = all(s["status"] == "completed" for s in episodes_stats)
-        return "completed" if all_completed else "production"
+        if any_segmented or assets_completed > 0 or project.get("overview"):
+            return "worldbuilding"
+        return "setup"
 
     def _calculate_phase_progress(self, project: dict, phase: str, episodes_stats: list[dict]) -> float:
         """计算当前阶段完成率 0.0–1.0"""
@@ -177,8 +222,18 @@ class StatusCalculator:
             "duration_seconds": 0,
         }
 
-    def _build_episodes_stats(self, project_name: str, project: dict) -> list[dict]:
-        """遍历所有集数，加载剧本并计算每集统计。"""
+    def _build_episodes_stats(
+        self,
+        project_name: str,
+        project: dict,
+        *,
+        preloaded_scripts: dict[str, dict] | None = None,
+    ) -> list[dict]:
+        """遍历所有集数，加载剧本并计算每集统计。
+
+        ``preloaded_scripts`` 按 ``episode['script_file']`` 原样作为 key，命中则
+        跳过 pm.load_script；未命中仍走磁盘加载 + 草稿探测的既有兜底路径。
+        """
         content_mode = project.get("content_mode", "narration")
         episodes_stats = []
         for ep in project.get("episodes", []):
@@ -187,7 +242,11 @@ class StatusCalculator:
 
             if script_file:
                 script_status, script = self._load_episode_script(
-                    project_name, episode_num, script_file, content_mode=content_mode
+                    project_name,
+                    episode_num,
+                    script_file,
+                    content_mode=content_mode,
+                    preloaded_scripts=preloaded_scripts,
                 )
             else:
                 script_status, script = "none", None
@@ -203,13 +262,21 @@ class StatusCalculator:
         return episodes_stats
 
     def calculate_project_status(
-        self, project_name: str, project: dict, *, _preloaded_episodes_stats: list[dict] | None = None
+        self,
+        project_name: str,
+        project: dict,
+        *,
+        _preloaded_episodes_stats: list[dict] | None = None,
+        preloaded_scripts: dict[str, dict] | None = None,
     ) -> dict:
         """
         计算项目整体状态（用于列表 API）。
 
         Args:
             _preloaded_episodes_stats: 若已由 enrich_project 预先计算，直接传入以避免重复 I/O。
+            preloaded_scripts: 调用方（如 list_projects）已加载的剧本字典，key 为
+                ``episode['script_file']`` 原值，value 为剧本 JSON。
+                命中即跳过 pm.load_script，避免与 resolve_project_cover 重复 I/O。
 
         Returns:
             ProjectStatus 字典：current_phase, phase_progress, characters, scenes, props, episodes_summary
@@ -235,9 +302,13 @@ class StatusCalculator:
         if _preloaded_episodes_stats is not None:
             episodes_stats = _preloaded_episodes_stats
         else:
-            episodes_stats = self._build_episodes_stats(project_name, project)
+            episodes_stats = self._build_episodes_stats(project_name, project, preloaded_scripts=preloaded_scripts)
 
-        phase = self.calculate_current_phase(project, episodes_stats)
+        phase = self.calculate_current_phase(
+            project,
+            episodes_stats,
+            assets_completed=chars_done + scenes_done + props_done,
+        )
         phase_progress = self._calculate_phase_progress(project, phase, episodes_stats)
         if phase == "worldbuilding":
             total_assets = chars_total + scenes_total + props_total

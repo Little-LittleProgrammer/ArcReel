@@ -1,11 +1,25 @@
-
 import { useState, type FormEvent } from "react";
+import { Loader2 } from "lucide-react";
 import { useAutoFocus } from "@/hooks/useAutoFocus";
-import { voidPromise } from "@/utils/async";
-import { useLocation } from "wouter";
+import { errMsg, voidPromise } from "@/utils/async";
+import { useLocation, useSearch } from "wouter";
 import { useTranslation } from "react-i18next";
 import { useAuthStore } from "@/stores/auth-store";
+import { safeReturnPath } from "@/utils/safe-url";
+import { BRAND } from "@/branding";
 import type { LoginResponse, ErrorResponse } from "@/api";
+import { FieldLabel } from "@/components/ui/FieldLabel";
+import {
+  ACCENT_BTN_CLS,
+  ACCENT_BUTTON_STYLE,
+  CARD_STYLE,
+  INPUT_CLS,
+  ambientGlowStyle,
+  posterGridStyle,
+} from "@/components/ui/darkroom-tokens";
+
+const POSTER_GRID_STYLE = posterGridStyle({ size: 44, maskShape: "60% 60% at 50% 35%", opacity: 0.05 });
+const AMBIENT_GLOW_STYLE = ambientGlowStyle();
 
 export function LoginPage() {
   const { t, i18n } = useTranslation(["common", "auth"]);
@@ -14,6 +28,7 @@ export function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [, setLocation] = useLocation();
+  const search = useSearch();
   const login = useAuthStore((s) => s.login);
   const usernameRef = useAutoFocus<HTMLInputElement>();
 
@@ -44,55 +59,85 @@ export function LoginPage() {
 
       const data = await resp.json() as LoginResponse;
       login(data.access_token, username);
-      setLocation("/app/projects");
+      // 登录成功后回跳到进入登录页前的原始地址（由 AuthGuard / 401 拦截以 ?from 传入），
+      // 经 safeReturnPath 校验为站内安全路径；非法或缺失时回退到项目列表。
+      const returnTo = safeReturnPath(new URLSearchParams(search).get("from"));
+      setLocation(returnTo ?? "/app/projects");
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("auth:login_failed"));
+      setError(errMsg(err, t("auth:login_failed")));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-950">
-      <div className="w-full max-w-sm rounded-xl border border-gray-800 bg-gray-900 p-8 shadow-2xl">
-        <h1 className="mb-6 flex items-center justify-center gap-2 text-xl font-semibold text-gray-100">
-          <img src="/android-chrome-192x192.png" alt="ArcReel" className="h-7 w-7" />
-          <span>ArcReel</span>
-        </h1>
+    <div
+      data-testid="login-page"
+      className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg px-4 text-text"
+    >
+      <div aria-hidden className="pointer-events-none absolute inset-0" style={AMBIENT_GLOW_STYLE} />
+      <div aria-hidden className="pointer-events-none absolute inset-0" style={POSTER_GRID_STYLE} />
+
+      <div
+        className="relative w-full max-w-sm overflow-hidden rounded-2xl border border-hairline p-8 shadow-2xl"
+        style={CARD_STYLE}
+      >
+        <div className="mb-6 text-center">
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-text-4">
+            system · login
+          </div>
+          <h1 className="font-editorial mt-1 flex items-center justify-center gap-2 text-[28px] tracking-tight text-text">
+            <img src="/android-chrome-192x192.png" alt="" aria-hidden className="h-7 w-7" />
+            <span>{BRAND.name}</span>
+          </h1>
+        </div>
 
         <form onSubmit={voidPromise(handleSubmit)} className="space-y-4">
           <div>
-            <label className="mb-1 block text-sm text-gray-400">{t("auth:username")}</label>
+            <FieldLabel htmlFor="login-username" required>
+              {t("auth:username")}
+            </FieldLabel>
             <input
+              id="login-username"
               type="text"
+              autoComplete="username"
+              spellCheck={false}
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-gray-100 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+              className={INPUT_CLS}
               ref={usernameRef}
               required
             />
           </div>
 
           <div>
-            <label className="mb-1 block text-sm text-gray-400">{t("auth:password")}</label>
+            <FieldLabel htmlFor="login-password" required>
+              {t("auth:password")}
+            </FieldLabel>
             <input
+              id="login-password"
               type="password"
+              autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-gray-100 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+              className={INPUT_CLS}
               required
             />
           </div>
 
           {error && (
-            <p className="text-sm text-red-400">{error}</p>
+            <p role="alert" aria-live="polite" className="text-sm text-warm-bright">
+              {error}
+            </p>
           )}
 
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-indigo-600 py-2 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:opacity-50"
+            className={`${ACCENT_BTN_CLS} w-full justify-center`}
+            style={ACCENT_BUTTON_STYLE}
           >
+            {loading && <Loader2 aria-hidden className="h-4 w-4 motion-safe:animate-spin" />}
             {loading ? t("auth:logging_in") : t("auth:login")}
           </button>
         </form>

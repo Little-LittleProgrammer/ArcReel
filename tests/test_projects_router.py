@@ -1,4 +1,6 @@
 import re
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -63,7 +65,7 @@ class _FakePM:
     def get_project_status(self, name):
         return {"current_stage": "source_ready"}
 
-    def create_project(self, name):
+    def create_project(self, name, content_mode="narration"):
         if not name or not re.fullmatch(r"[A-Za-z0-9-]+", name):
             raise ValueError("项目标识仅允许英文字母、数字和中划线")
         if name == "exists":
@@ -113,7 +115,27 @@ class _FakePM:
         return self.scripts[key]
 
     def save_script(self, name, payload, script_file):
+        if script_file.startswith("scripts/"):
+            script_file = script_file[len("scripts/") :]
         self.scripts[(name, script_file)] = payload
+
+    def update_project(self, name, mutate_fn):
+        # 复刻真实 ProjectManager.update_project：load → mutate → save 单一事务，
+        # 并返回迁移后的 project dict（调用方据此回前端，无需二次 load_project）。
+        # deepcopy 后再 mutate，使异常时（save 未执行）backing store 不被原地突变污染，
+        # 忠实于真实 PM「读裸 JSON、出错不写回」的语义。
+        project = deepcopy(self.load_project(name))
+        mutate_fn(project)
+        self.save_project(name, project)
+        return project
+
+    @contextmanager
+    def locked_script(self, name, script_file):
+        # 复刻真实 ProjectManager.locked_script：load → yield → save，异常时跳过写回。
+        # deepcopy 同上，确保 with 体内抛异常时原始存储对象保持不变。
+        script = deepcopy(self.load_script(name, script_file))
+        yield script
+        self.save_script(name, script, script_file)
 
     async def generate_overview(self, name):
         if name == "ready":
@@ -122,7 +144,13 @@ class _FakePM:
 
 
 class _FakeCalc:
-    def calculate_project_status(self, name, project):
+    def __init__(self):
+        # 记录 list_projects 是否把一次性加载的 script map 传到 calculate_project_status，
+        # 让针对 Task 4 的集成测试能断言两路共享预加载。
+        self.last_preloaded_scripts: dict | None = None
+
+    def calculate_project_status(self, name, project, *, preloaded_scripts=None):
+        self.last_preloaded_scripts = preloaded_scripts
         return {
             "current_phase": "production",
             "phase_progress": 0.5,
@@ -242,6 +270,13 @@ class TestProjectsRouter:
             assert updated_ratio.status_code == 200
             assert updated_ratio.json()["project"]["aspect_ratio"] == "16:9"
 
+            # 退役的 image_backend 字段在 PATCH 上也被直接拒绝
+            rejected_legacy = client.patch(
+                "/api/v1/projects/ready",
+                json={"image_backend": "gemini-aistudio/nano-banana"},
+            )
+            assert rejected_legacy.status_code == 400
+
             get_script = client.get("/api/v1/projects/ready/scripts/episode_1.json")
             assert get_script.status_code == 200
 
@@ -263,14 +298,14 @@ class TestProjectsRouter:
 
         with client:
             patch_scene = client.patch(
-                "/api/v1/projects/ready/scenes/001",
+                "/api/v1/projects/ready/script-scenes/001",
                 json={"script_file": "episode_1.json", "updates": {"duration_seconds": 6, "segment_break": True}},
             )
             assert patch_scene.status_code == 200
             assert patch_scene.json()["scene"]["duration_seconds"] == 6
 
             patch_scene_missing = client.patch(
-                "/api/v1/projects/ready/scenes/404",
+                "/api/v1/projects/ready/script-scenes/404",
                 json={"script_file": "episode_1.json", "updates": {}},
             )
             assert patch_scene_missing.status_code == 404
@@ -295,6 +330,131 @@ class TestProjectsRouter:
 
             gen_overview_ok = client.post("/api/v1/projects/ready/generate-overview")
             assert gen_overview_ok.status_code == 200
+
+    def test_update_segment_writes_character_and_clue_refs(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ready", "narration.json")] = {
+            "content_mode": "narration",
+            "segments": [
+                {
+                    "segment_id": "E1S01",
+                    "duration_seconds": 4,
+                    "characters_in_segment": ["Alice"],
+                    "scenes": ["Forest"],
+                    "props": ["Sword"],
+                }
+            ],
+        }
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            # 写入新引用列表
+            patched = client.patch(
+                "/api/v1/projects/ready/segments/E1S01",
+                json={
+                    "script_file": "narration.json",
+                    "characters_in_segment": ["Bob", "Carol"],
+                    "scenes": ["Castle"],
+                    "props": [],
+                },
+            )
+            assert patched.status_code == 200
+            seg = patched.json()["segment"]
+            assert seg["characters_in_segment"] == ["Bob", "Carol"]
+            assert seg["scenes"] == ["Castle"]
+            assert seg["props"] == []
+
+            # 不传字段时不应改动现有值
+            untouched = client.patch(
+                "/api/v1/projects/ready/segments/E1S01",
+                json={"script_file": "narration.json", "duration_seconds": 7},
+            )
+            assert untouched.status_code == 200
+            seg2 = untouched.json()["segment"]
+            assert seg2["duration_seconds"] == 7
+            assert seg2["characters_in_segment"] == ["Bob", "Carol"]
+            assert seg2["scenes"] == ["Castle"]
+            assert seg2["props"] == []
+
+    def test_update_segment_rejects_drama_script_with_residual_segments(self, tmp_path, monkeypatch):
+        # drama 脚本残留 segments 键不应被当 narration 改写：须返回 400 而非放行
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ready", "drama.json")] = {
+            "content_mode": "drama",
+            "segments": [{"segment_id": "E1S01", "duration_seconds": 4}],
+            "scenes": [{"scene_id": "E1S01"}],
+        }
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready/segments/E1S01",
+                json={"script_file": "drama.json", "duration_seconds": 7},
+            )
+            assert resp.status_code == 400
+
+    def test_update_segment_write_value_error_returns_422(self, tmp_path, monkeypatch):
+        # 写盘统一入口对客户端错误（结构非法 / 集号错配 / 非法文件名）抛 ValueError，
+        # router 须统一转 422 而非落到 500 兜底。
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ready", "narration.json")] = {
+            "content_mode": "narration",
+            "segments": [{"segment_id": "E1S01", "duration_seconds": 4}],
+        }
+
+        @contextmanager
+        def _raising_locked_script(name, script_file):
+            script = fake_pm.load_script(name, script_file)
+            yield script
+            raise ValueError("脚本内 episode=1 与文件名 episode_10 不一致")
+
+        monkeypatch.setattr(fake_pm, "locked_script", _raising_locked_script)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/ready/segments/E1S01",
+                json={"script_file": "narration.json", "duration_seconds": 7},
+            )
+            assert resp.status_code == 422
+            assert "不一致" in resp.json()["detail"]
+
+    def test_update_scene_supports_character_and_clue_refs(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ready", "episode_1.json")] = {
+            "content_mode": "drama",
+            "scenes": [
+                {
+                    "scene_id": "001",
+                    "duration_seconds": 8,
+                    "characters_in_scene": ["Alice"],
+                    "scenes": [],
+                    "props": [],
+                }
+            ],
+        }
+
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            patched = client.patch(
+                "/api/v1/projects/ready/script-scenes/001",
+                json={
+                    "script_file": "episode_1.json",
+                    "updates": {
+                        "characters_in_scene": ["Bob"],
+                        "scenes": ["Castle"],
+                        "props": ["Map"],
+                    },
+                },
+            )
+            assert patched.status_code == 200
+            scene = patched.json()["scene"]
+            assert scene["characters_in_scene"] == ["Bob"]
+            assert scene["scenes"] == ["Castle"]
+            assert scene["props"] == ["Map"]
 
             gen_overview_bad = client.post("/api/v1/projects/bad/generate-overview")
             assert gen_overview_bad.status_code == 400
@@ -365,7 +525,7 @@ class TestProjectsRouter:
                     "title": "模型项目",
                     "name": "m-1",
                     "video_backend": "gemini-aistudio/veo-3",
-                    "image_backend": "gemini-aistudio/nano-banana",
+                    "image_provider_t2i": "gemini-aistudio/nano-banana",
                     "text_backend_script": "gemini-aistudio/gemini-2.5",
                     "default_duration": 8,
                 },
@@ -373,9 +533,22 @@ class TestProjectsRouter:
             assert resp.status_code == 200
             data = fake_pm.project_data["m-1"]
             assert data["video_backend"] == "gemini-aistudio/veo-3"
-            assert data["image_backend"] == "gemini-aistudio/nano-banana"
+            assert data["image_provider_t2i"] == "gemini-aistudio/nano-banana"
             assert data["text_backend_script"] == "gemini-aistudio/gemini-2.5"
             assert data["default_duration"] == 8
+
+    def test_create_project_rejects_legacy_image_backend(self, tmp_path, monkeypatch):
+        """退役的 image_backend 字段在写路径被直接 400 拒绝，避免静默错配（应改用 image_provider_t2i/i2i）。"""
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={"title": "旧字段项目", "name": "legacy-1", "image_backend": "gemini-aistudio/nano-banana"},
+            )
+            assert resp.status_code == 400
+            assert "legacy-1" not in fake_pm.project_data
 
     def test_create_project_empty_model_fields_not_written(self, tmp_path, monkeypatch):
         fake_pm = _FakePM(tmp_path)
@@ -407,7 +580,7 @@ class TestProjectsRouter:
                 json={
                     "title": "Bad Backend",
                     "name": "bad-bk",
-                    "video_backend": "garbage",  # 无 "/"，且不在 _LEGACY_PROVIDER_NAMES/PROVIDER_REGISTRY
+                    "video_backend": "garbage",  # 无 "/"，且不在 PROVIDER_REGISTRY
                 },
             )
             assert resp.status_code == 400
@@ -474,6 +647,34 @@ class TestProjectsRouter:
             data = fake_pm.project_data["ready"]
             assert "style_image" not in data
             assert "style_description" not in data
+
+    def test_list_projects_shares_script_preload_with_status(self, tmp_path, monkeypatch):
+        """list_projects 一次性加载 episode scripts，传给 StatusCalculator，去除 cover + status 双重 I/O。"""
+        fake_pm = _FakePM(tmp_path)
+        # 统计 load_script 调用次数：共享预加载后，ready 项目应只触发一次。
+        orig_load_script = fake_pm.load_script
+        calls: list[tuple[str, str]] = []
+
+        def _counting_load(name, script_file):
+            calls.append((name, script_file))
+            return orig_load_script(name, script_file)
+
+        fake_pm.load_script = _counting_load  # type: ignore[method-assign]
+
+        fake_calc = _FakeCalc()
+        client = _client(monkeypatch, fake_pm, fake_calc)
+        with client:
+            resp = client.get("/api/v1/projects")
+            assert resp.status_code == 200
+
+        # ready 只有 1 集 script_file="scripts/episode_1.json"：预加载一次。
+        # 若 cover + status 各自独立加载，这里会是 2 次。
+        ready_calls = [c for c in calls if c[0] == "ready"]
+        assert len(ready_calls) == 1, f"expected 1 shared load, got {ready_calls}"
+
+        # 预加载 map 被传给 StatusCalculator
+        assert fake_calc.last_preloaded_scripts is not None
+        assert "scripts/episode_1.json" in fake_calc.last_preloaded_scripts
 
     def test_list_projects_returns_style_image_field(self, tmp_path, monkeypatch):
         """列表端点需返回 style_image：否则前端无法区分"自定义风格"与"未设置"。"""
@@ -624,3 +825,94 @@ class TestProjectsRouter:
             # 其他字段保持不变
             assert ep1["title"] == "第一集"
             assert ep1["script_file"] == "scripts/ep1.json"
+
+
+class TestGetVideoCapabilities:
+    """GET /projects/{name}/video-capabilities"""
+
+    def _patch_resolver(self, monkeypatch, side_effect=None, return_value=None):
+        """用 MagicMock 替换 ConfigResolver 类，让其 instance.video_capabilities() 返回指定行为。"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        resolver_instance = MagicMock()
+        if side_effect is not None:
+            resolver_instance.video_capabilities = AsyncMock(side_effect=side_effect)
+        else:
+            resolver_instance.video_capabilities = AsyncMock(return_value=return_value)
+        monkeypatch.setattr(projects, "ConfigResolver", lambda _factory: resolver_instance)
+        return resolver_instance
+
+    def test_returns_capabilities_json(self, tmp_path, monkeypatch):
+        fake_caps = {
+            "provider_id": "grok",
+            "model": "grok-imagine-video",
+            "supported_durations": list(range(1, 16)),
+            "max_duration": 15,
+            "max_reference_images": 7,
+            "source": "registry",
+            "default_duration": None,
+            "content_mode": "narration",
+            "generation_mode": "reference_video",
+        }
+        self._patch_resolver(monkeypatch, return_value=fake_caps)
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.get("/api/v1/projects/ready/video-capabilities")
+            assert resp.status_code == 200
+            assert resp.json() == fake_caps
+
+    def test_unknown_project_returns_404(self, tmp_path, monkeypatch):
+        self._patch_resolver(monkeypatch, side_effect=FileNotFoundError("项目 'nonexistent' 不存在"))
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.get("/api/v1/projects/nonexistent/video-capabilities")
+            assert resp.status_code == 404
+
+    def test_resolver_value_error_returns_422(self, tmp_path, monkeypatch):
+        self._patch_resolver(monkeypatch, side_effect=ValueError("model not found: grok/unknown"))
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.get("/api/v1/projects/ready/video-capabilities")
+            assert resp.status_code == 422
+            assert "model not found" in resp.json()["detail"]
+
+
+class TestModelSettingsApi:
+    def test_create_project_with_model_settings(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "name": "demo-res",
+                    "title": "T",
+                    "model_settings": {
+                        "gemini-aistudio/veo-3.1-lite-generate-preview": {"resolution": "720p"},
+                    },
+                },
+            )
+            assert resp.status_code == 200
+            # 直接从 create 返回值验证 model_settings 已持久化
+            project = resp.json()["project"]
+            assert project["model_settings"]["gemini-aistudio/veo-3.1-lite-generate-preview"]["resolution"] == "720p"
+            # 也验证 fake_pm 内部存储
+            stored = fake_pm.project_data["demo-res"]
+            assert stored["model_settings"]["gemini-aistudio/veo-3.1-lite-generate-preview"]["resolution"] == "720p"
+
+    def test_patch_project_model_settings(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            # 先创建（利用现有 ready 项目）
+            resp = client.patch(
+                "/api/v1/projects/ready",
+                json={"model_settings": {"gemini-aistudio/veo-3.1": {"resolution": "1080p"}}},
+            )
+            assert resp.status_code == 200
+            # 直接从 patch 返回值验证 model_settings
+            project = resp.json()["project"]
+            assert project["model_settings"]["gemini-aistudio/veo-3.1"]["resolution"] == "1080p"
+            # 也验证 fake_pm 内部存储
+            stored = fake_pm.project_data["ready"]
+            assert stored["model_settings"]["gemini-aistudio/veo-3.1"]["resolution"] == "1080p"

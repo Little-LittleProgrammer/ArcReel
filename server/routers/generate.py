@@ -13,15 +13,13 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib import PROJECT_ROOT
+from lib.app_data_dir import app_data_dir
 from lib.asset_types import ASSET_SPECS
 from lib.generation_queue import get_generation_queue
+from lib.generation_queue_client import TaskSpec, TaskSpecValidationError
 from lib.i18n import Translator
 from lib.project_manager import ProjectManager
-from lib.prompt_utils import (
-    is_structured_image_prompt,
-    is_structured_video_prompt,
-)
+from lib.script_editor import ScriptEditError
 from lib.storyboard_sequence import (
     find_storyboard_item,
     get_storyboard_items,
@@ -31,7 +29,7 @@ from server.auth import CurrentUser
 router = APIRouter()
 
 # 初始化管理器
-pm = ProjectManager(PROJECT_ROOT / "projects")
+pm = ProjectManager(app_data_dir())
 
 
 def get_project_manager() -> ProjectManager:
@@ -44,7 +42,6 @@ def get_project_manager() -> ProjectManager:
 class GenerateStoryboardRequest(BaseModel):
     prompt: str | dict
     script_file: str
-    extra_reference_images: list[str] | None = None
 
 
 class GenerateVideoRequest(BaseModel):
@@ -64,38 +61,6 @@ class GenerateSceneRequest(BaseModel):
 
 class GeneratePropRequest(BaseModel):
     prompt: str
-
-
-_LEGACY_PROVIDER_NAMES: dict[str, str] = {
-    "gemini": "gemini-aistudio",
-    "aistudio": "gemini-aistudio",
-    "vertex": "gemini-vertex",
-}
-
-
-def _normalize_provider_id(raw: str) -> str:
-    """将旧格式 provider 名称归一化为标准 provider_id。"""
-    return _LEGACY_PROVIDER_NAMES.get(raw, raw)
-
-
-def _snapshot_image_backend(project_name: str) -> dict:
-    """快照图片供应商配置，返回可合并到 payload 的字典。
-
-    优先级：项目级 image_backend > 系统级 default_image_backend。
-    """
-    project = get_project_manager().load_project(project_name)
-    project_image_backend = project.get("image_backend")  # 格式: "provider_id/model"
-    if project_image_backend and "/" in project_image_backend:
-        image_provider, image_model = project_image_backend.split("/", 1)
-    elif project_image_backend:
-        image_provider = _normalize_provider_id(project_image_backend)
-        image_model = ""
-    else:
-        return {}  # 无项目级覆盖，使用全局默认
-    return {
-        "image_provider": image_provider,
-        "image_model": image_model,
-    }
 
 
 # ==================== 分镜图生成 ====================
@@ -123,37 +88,30 @@ async def generate_storyboard(
             resolved = find_storyboard_item(items, id_field, segment_id)
             if resolved is None:
                 raise HTTPException(status_code=404, detail=_t("segment_not_found", id=segment_id))
-            return _snapshot_image_backend(project_name)
 
-        image_snapshot = await asyncio.to_thread(_sync)
+        await asyncio.to_thread(_sync)
 
-        # 验证 prompt 格式
-        if isinstance(req.prompt, dict):
-            if not is_structured_image_prompt(req.prompt):
-                raise HTTPException(
-                    status_code=400,
-                    detail=_t("prompt_must_be_string_or_scene_object"),
-                )
-            scene_text = str(req.prompt.get("scene", "")).strip()
-            if not scene_text:
-                raise HTTPException(status_code=400, detail=_t("prompt_scene_empty"))
-        elif not isinstance(req.prompt, str):
-            raise HTTPException(status_code=400, detail=_t("prompt_must_be_string_or_object"))
+        # 结构校验 + 构造经单一守卫点（与 SDK 入队同源，规则不分叉）
+        try:
+            spec = TaskSpec.from_request(
+                task_type="storyboard",
+                media_type="image",
+                resource_id=segment_id,
+                prompt=req.prompt,
+                script_file=req.script_file,
+            )
+        except TaskSpecValidationError as e:
+            raise HTTPException(status_code=400, detail=_t(e.code, **e.params))
 
         # 入队
         queue = get_generation_queue()
         result = await queue.enqueue_task(
             project_name=project_name,
-            task_type="storyboard",
-            media_type="image",
-            resource_id=segment_id,
-            script_file=req.script_file,
-            payload={
-                "prompt": req.prompt,
-                "script_file": req.script_file,
-                "extra_reference_images": req.extra_reference_images or [],
-                **image_snapshot,
-            },
+            task_type=spec.task_type,
+            media_type=spec.media_type,
+            resource_id=spec.resource_id,
+            script_file=spec.script_file,
+            payload=spec.payload,
             source="webui",
             user_id=_user.id,
         )
@@ -168,6 +126,9 @@ async def generate_storyboard(
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
+    except ScriptEditError as e:
+        # 脏脚本(分镜数组键损坏)→ 4xx 客户端错误而非 5xx,detail 走 i18n 不直接暴露 str(e)
+        raise HTTPException(status_code=400, detail=_t("script_data_corrupted", reason=str(e)))
     except Exception as e:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -192,44 +153,67 @@ async def generate_video(
     try:
 
         def _sync():
-            get_project_manager().load_project(project_name)
-            project_path = get_project_manager().get_project_path(project_name)
-            storyboard_file = project_path / "storyboards" / f"scene_{segment_id}.png"
+            pm_local = get_project_manager()
+            pm_local.load_project(project_name)
+            project_path = pm_local.get_project_path(project_name)
+
+            # 与 worker 一致：优先读取 generated_assets.storyboard_image，回退默认路径。
+            # 旧宫格项目 storyboard_image 指向 scene_{id}_first.png，仍可正常解析。
+            storyboard_rel: str | None = None
+            try:
+                script = pm_local.load_script(project_name, req.script_file)
+                items, id_field, _, _, _ = get_storyboard_items(script)
+                resolved = find_storyboard_item(items, id_field, segment_id)
+                if resolved:
+                    assets = resolved[0].get("generated_assets") or {}
+                    if isinstance(assets, dict):
+                        storyboard_rel = assets.get("storyboard_image")
+            except FileNotFoundError:
+                # 脚本不存在交由后续流程报错；此处只负责存在性检查
+                pass
+            except ScriptEditError as exc:
+                # 脏脚本(分镜数组键损坏)→ fail-fast 4xx,与 storyboard endpoint 对齐。
+                # 不再 silently pass 降级走 default 路径:default 文件恰好存在时会让请求
+                # 「先返回提交成功、worker 解析脚本时再确定失败」,撕裂用户预期;脚本损坏是
+                # 路由层就能识别的客户端错误,提前 4xx 比让 worker 后置失败更准确。
+                raise HTTPException(
+                    status_code=400,
+                    detail=_t("script_data_corrupted", reason=str(exc)),
+                )
+
+            storyboard_file = (
+                project_path / storyboard_rel
+                if storyboard_rel
+                else project_path / "storyboards" / f"scene_{segment_id}.png"
+            )
             if not storyboard_file.exists():
                 raise HTTPException(status_code=400, detail=_t("generate_storyboard_first", segment_id=segment_id))
 
         await asyncio.to_thread(_sync)
 
-        # 验证 prompt 格式
-        if isinstance(req.prompt, dict):
-            if not is_structured_video_prompt(req.prompt):
-                raise HTTPException(
-                    status_code=400,
-                    detail=_t("video_prompt_must_be_string_or_action_object"),
-                )
-            action_text = str(req.prompt.get("action", "")).strip()
-            if not action_text:
-                raise HTTPException(status_code=400, detail=_t("video_prompt_action_empty"))
-            dialogue = req.prompt.get("dialogue", [])
-            if dialogue is not None and not isinstance(dialogue, list):
-                raise HTTPException(status_code=400, detail=_t("video_prompt_dialogue_array"))
-        elif not isinstance(req.prompt, str):
-            raise HTTPException(status_code=400, detail=_t("prompt_must_be_string_or_object"))
+        # 结构校验 + 构造经单一守卫点（与 SDK 入队同源，规则不分叉）。
+        # duration 是能力维度，留待执行层在 provider 解析后校验（见 ADR-0001）。
+        try:
+            spec = TaskSpec.from_request(
+                task_type="video",
+                media_type="video",
+                resource_id=segment_id,
+                prompt=req.prompt,
+                script_file=req.script_file,
+                extra_payload={"duration_seconds": req.duration_seconds, "seed": req.seed},
+            )
+        except TaskSpecValidationError as e:
+            raise HTTPException(status_code=400, detail=_t(e.code, **e.params))
 
         # 入队（provider 由服务层根据配置自动解析，调用方无需传递）
         queue = get_generation_queue()
         result = await queue.enqueue_task(
             project_name=project_name,
-            task_type="video",
-            media_type="video",
-            resource_id=segment_id,
-            script_file=req.script_file,
-            payload={
-                "prompt": req.prompt,
-                "script_file": req.script_file,
-                "duration_seconds": req.duration_seconds,
-                "seed": req.seed,
-            },
+            task_type=spec.task_type,
+            media_type=spec.media_type,
+            resource_id=spec.resource_id,
+            script_file=spec.script_file,
+            payload=spec.payload,
             source="webui",
             user_id=_user.id,
         )
@@ -277,17 +261,26 @@ async def _enqueue_asset_generation(
         project = get_project_manager().load_project(project_name)
         if resource_name not in project.get(spec.bucket_key, {}):
             raise HTTPException(status_code=404, detail=_t(keys["not_found"], name=resource_name))
-        return _snapshot_image_backend(project_name)
 
-    image_snapshot = await asyncio.to_thread(_sync)
+    await asyncio.to_thread(_sync)
+
+    try:
+        task_spec = TaskSpec.from_request(
+            task_type=asset_type,
+            media_type="image",
+            resource_id=resource_name,
+            prompt=prompt,
+        )
+    except TaskSpecValidationError as e:
+        raise HTTPException(status_code=400, detail=_t(e.code, **e.params))
 
     queue = get_generation_queue()
     result = await queue.enqueue_task(
         project_name=project_name,
-        task_type=asset_type,
-        media_type="image",
-        resource_id=resource_name,
-        payload={"prompt": prompt, **image_snapshot},
+        task_type=task_spec.task_type,
+        media_type=task_spec.media_type,
+        resource_id=task_spec.resource_id,
+        payload=task_spec.payload,
         source="webui",
         user_id=user_id,
     )

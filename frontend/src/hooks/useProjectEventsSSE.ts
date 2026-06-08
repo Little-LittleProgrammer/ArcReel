@@ -1,9 +1,11 @@
 import { startTransition, useCallback, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { useLocation } from "wouter";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useCostStore } from "@/stores/cost-store";
+import { errMsg } from "@/utils/async";
 import type {
   ProjectChange,
   ProjectChangeBatchPayload,
@@ -113,12 +115,19 @@ function isWorkspaceEditing(): boolean {
 }
 
 export function useProjectEventsSSE(projectName?: string | null): void {
+  const { t } = useTranslation("dashboard");
+  // 把 t 通过 ref 暴露给 callback，避免 i18n 切语言时 refreshProject
+  // 重建 → EventSource effect 跟着重连 → 通知/focus 提示丢失。
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
   const [, setLocation] = useLocation();
   const setCurrentProject = useProjectsStore((s) => s.setCurrentProject);
   const invalidateEntities = useAppStore((s) => s.invalidateEntities);
   const triggerScrollTo = useAppStore((s) => s.triggerScrollTo);
   const clearScrollTarget = useAppStore((s) => s.clearScrollTarget);
-  const pushToast = useAppStore((s) => s.pushToast);
+  const pushNotification = useAppStore((s) => s.pushNotification);
   const pushWorkspaceNotification = useAppStore((s) => s.pushWorkspaceNotification);
   const clearWorkspaceNotifications = useAppStore((s) => s.clearWorkspaceNotifications);
   const setAssistantToolActivitySuppressed = useAppStore(
@@ -167,20 +176,28 @@ export function useProjectEventsSSE(projectName?: string | null): void {
 
     refreshingRef.current = true;
     try {
-      const res = await API.getProject(projectName);
-      setCurrentProject(projectName, res.project, res.scripts ?? {}, res.asset_fingerprints);
-    } catch (err) {
-      pushToast(`同步项目变更失败: ${(err as Error).message}`, "warning");
+      // while 循环替代递归自调用，规避 react-hooks/immutability 的自引用限制。
+      // API 异常单独捕获，确保失败路径也消费排队中的 needsRefreshRef
+      // （与旧递归实现的"成功或失败都会再跑一轮"语义一致）。
+      let again = true;
+      while (again) {
+        again = false;
+        try {
+          const res = await API.getProject(projectName);
+          setCurrentProject(projectName, res.project, res.scripts ?? {}, res.asset_fingerprints);
+        } catch (err) {
+          pushNotification(tRef.current("project_sync_failed", { message: errMsg(err) }), "warning");
+        }
+        if (needsRefreshRef.current) {
+          needsRefreshRef.current = false;
+          again = true;
+        }
+      }
     } finally {
       refreshingRef.current = false;
     }
-    if (needsRefreshRef.current) {
-      needsRefreshRef.current = false;
-      void refreshProject();
-      return;
-    }
     flushQueuedFocus();
-  }, [flushQueuedFocus, projectName, pushToast, setCurrentProject]);
+  }, [flushQueuedFocus, projectName, pushNotification, setCurrentProject]);
 
   useEffect(() => {
     lastFingerprintRef.current = null;
@@ -246,7 +263,7 @@ export function useProjectEventsSSE(projectName?: string | null): void {
               if (!hasImportantChanges(group)) {
                 continue;
               }
-              pushToast(formatGroupedNotificationText(group), "success");
+              pushNotification(formatGroupedNotificationText(group), "success");
             }
           }
 
@@ -335,9 +352,9 @@ export function useProjectEventsSSE(projectName?: string | null): void {
     clearWorkspaceNotifications,
     invalidateEntities,
     projectName,
+    pushNotification,
     pushWorkspaceNotification,
     refreshProject,
-    pushToast,
     setAssistantToolActivitySuppressed,
     setLocation,
   ]);

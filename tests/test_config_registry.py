@@ -2,7 +2,16 @@ from lib.config.registry import PROVIDER_REGISTRY, ModelInfo, ProviderMeta
 
 
 def test_all_providers_registered():
-    assert set(PROVIDER_REGISTRY.keys()) == {"gemini-aistudio", "gemini-vertex", "ark", "grok", "openai"}
+    assert set(PROVIDER_REGISTRY.keys()) == {
+        "gemini-aistudio",
+        "gemini-vertex",
+        "ark",
+        "ark-agent-plan",
+        "grok",
+        "openai",
+        "vidu",
+        "dashscope",
+    }
 
 
 def test_provider_meta_fields():

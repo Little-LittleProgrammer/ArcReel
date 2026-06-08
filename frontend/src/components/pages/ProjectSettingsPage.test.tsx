@@ -29,6 +29,8 @@ const FAKE_CONFIG_WITH_DEFAULTS = {
   settings: {
     default_video_backend: "gemini/veo-3",
     default_image_backend: "gemini/nano-banana",
+    default_image_backend_t2i: "gemini/nano-banana",
+    default_image_backend_i2i: "gemini/nano-banana",
     text_backend_script: "gemini/g25",
     text_backend_overview: "gemini/g25",
     text_backend_style: "gemini/g25",
@@ -203,9 +205,9 @@ describe("ProjectSettingsPage – style picker", () => {
 
     renderAt("/app/projects/demo/settings");
 
-    // Wait for config to load and a model trigger to render
-    const imageTrigger = await screen.findByRole("combobox", { name: /图片模型/ });
-    expect(imageTrigger).toHaveTextContent(/跟随全局默认/);
+    // 项目无 image override + 全局默认双能力 → 单下拉模式（label = 图片模型 / Image Model）
+    const imageTrigger = await screen.findByRole("combobox", { name: /^(图片模型|Image Model)$/ });
+    expect(imageTrigger).toHaveTextContent(/跟随全局默认|Use global default/);
     expect(imageTrigger).toHaveTextContent(/nano-banana/);
   });
 
@@ -270,5 +272,133 @@ describe("ProjectSettingsPage – style picker", () => {
     // The main save button should be enabled (it is never disabled except while saving)
     const saveBtn = screen.getByRole("button", { name: /^(保存|Save)$/i });
     expect(saveBtn).not.toBeDisabled();
+  });
+});
+
+describe("ProjectSettingsPage – model_settings resolution", () => {
+  beforeEach(() => {
+    useAppStore.setState(useAppStore.getInitialState(), true);
+    vi.restoreAllMocks();
+    vi.spyOn(providerModels, "getProviderModels").mockResolvedValue([]);
+    vi.spyOn(providerModels, "getCustomProviderModels").mockResolvedValue([]);
+  });
+
+  it("loads existing model_settings resolution into video/image pickers", async () => {
+    vi.spyOn(API, "getSystemConfig").mockResolvedValue({
+      ...FAKE_CONFIG_WITH_DEFAULTS,
+    } as unknown as Awaited<ReturnType<typeof API.getSystemConfig>>);
+    // 提供含 resolutions 的 provider，使 ResolutionPicker 能够渲染
+    vi.spyOn(providerModels, "getProviderModels").mockResolvedValue([
+      {
+        id: "gemini",
+        display_name: "Gemini",
+        description: "",
+        status: "ready",
+        media_types: ["video", "image"],
+        capabilities: [],
+        configured_keys: [],
+        missing_keys: [],
+        models: {
+          "veo-3": {
+            display_name: "Veo 3",
+            media_type: "video",
+            capabilities: [],
+            default: true,
+            supported_durations: [5, 8],
+            duration_resolution_constraints: {},
+            resolutions: ["720p", "1080p"],
+          },
+          "nano-banana": {
+            display_name: "Nano Banana",
+            media_type: "image",
+            capabilities: [],
+            default: true,
+            supported_durations: [],
+            duration_resolution_constraints: {},
+            resolutions: ["720p", "1080p"],
+          },
+        },
+      },
+    ] as Awaited<ReturnType<typeof providerModels.getProviderModels>>);
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: {
+        title: "Demo",
+        video_backend: "gemini/veo-3",
+        image_provider_t2i: "gemini/nano-banana",
+        image_provider_i2i: "gemini/nano-banana",
+        model_settings: {
+          "gemini/veo-3": { resolution: "1080p" },
+          "gemini/nano-banana": { resolution: "720p" },
+        },
+        episodes: [],
+        characters: {},
+        clues: {},
+      },
+      scripts: {},
+    } as unknown as Awaited<ReturnType<typeof API.getProject>>);
+
+    renderAt("/app/projects/demo/settings");
+
+    // 等待 ResolutionPicker 出现并验证已加载的初始值
+    // select 模式的 ResolutionPicker 渲染为 <select>，当前值会是对应 option selected
+    await waitFor(() => {
+      const selects = screen.getAllByRole("combobox");
+      // 找到视频分辨率 select（aria-label 为 "分辨率"）
+      const resSelects = selects.filter((el) =>
+        el.getAttribute("aria-label")?.includes("分辨率") || el.getAttribute("aria-label")?.includes("Resolution"),
+      );
+      expect(resSelects.length).toBeGreaterThan(0);
+      // 验证已加载的值
+      const values = resSelects.map((el) => (el as HTMLSelectElement).value);
+      expect(values).toContain("1080p");
+      expect(values).toContain("720p");
+    });
+  });
+
+  it("saves resolution changes via updateProject with model_settings", async () => {
+    vi.spyOn(API, "getSystemConfig").mockResolvedValue({
+      ...FAKE_CONFIG_WITH_DEFAULTS,
+    } as unknown as Awaited<ReturnType<typeof API.getSystemConfig>>);
+    // getProject 会被 handleSave 内调用一次（获取 existingModelSettings），mock 始终返回相同 project
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: {
+        title: "Demo",
+        video_backend: "gemini/veo-3",
+        image_provider_t2i: "gemini/nano-banana",
+        image_provider_i2i: "gemini/nano-banana",
+        model_settings: {
+          "gemini/veo-3": { resolution: "1080p" },
+          "gemini/nano-banana": { resolution: "720p" },
+        },
+        episodes: [],
+        characters: {},
+        clues: {},
+      },
+      scripts: {},
+    } as unknown as Awaited<ReturnType<typeof API.getProject>>);
+    const updateSpy = vi.spyOn(API, "updateProject").mockResolvedValue({
+      success: true,
+      project: { title: "Demo" } as unknown as Awaited<ReturnType<typeof API.updateProject>>["project"],
+    });
+
+    renderAt("/app/projects/demo/settings");
+
+    // 等配置加载完
+    await screen.findByRole("radio", { name: /竖屏 9:16/ });
+
+    const saveBtn = screen.getByRole("button", { name: /^(保存|Save)$/i });
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith(
+        "demo",
+        expect.objectContaining({
+          model_settings: expect.objectContaining({
+            "gemini/veo-3": expect.objectContaining({ resolution: "1080p" }),
+            "gemini/nano-banana": expect.objectContaining({ resolution: "720p" }),
+          }),
+        }),
+      );
+    });
   });
 });

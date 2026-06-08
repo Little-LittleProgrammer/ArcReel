@@ -15,6 +15,9 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
+import { errMsg } from "@/utils/async";
+import { useProjectsStore } from "@/stores/projects-store";
+import { useAppStore } from "@/stores/app-store";
 import type { GridGeneration, ReferenceImage } from "@/types/grid";
 
 // ---------------------------------------------------------------------------
@@ -28,6 +31,8 @@ export interface GridPreviewPanelProps {
   onRegenerated?: () => void;
   /** Changed when grids list is refreshed, triggers re-fetch of panel data. */
   refreshKey?: number;
+  /** Render in expanded state on first mount. Used by the dedicated grid preview tab. */
+  defaultExpanded?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,10 +102,12 @@ function ReferenceImageStrip({
   projectName: string;
   refreshKey: number;
 }) {
+  const fingerprints = useProjectsStore((s) => s.assetFingerprints);
   return (
     <div className="flex gap-2.5 overflow-x-auto pb-1 scrollbar-thin">
       {references.map((ref, idx) => {
         const isChar = ref.ref_type === "character";
+        const cacheBust = fingerprints[ref.path] ?? refreshKey;
         return (
           <motion.div
             key={ref.path}
@@ -117,7 +124,7 @@ function ReferenceImageStrip({
               }`}
             >
               <img
-                src={API.getFileUrl(projectName, ref.path, refreshKey)}
+                src={API.getFileUrl(projectName, ref.path, cacheBust)}
                 alt={ref.name}
                 className="block aspect-square w-full object-cover transition-transform duration-200 group-hover:scale-105"
               />
@@ -153,8 +160,9 @@ export function GridPreviewPanel({
   gridIds,
   onRegenerated,
   refreshKey = 0,
+  defaultExpanded = false,
 }: GridPreviewPanelProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [grid, setGrid] = useState<GridGeneration | null>(null);
   const [loading, setLoading] = useState(false);
@@ -167,6 +175,11 @@ export function GridPreviewPanel({
   const safeIdx = Math.min(selectedIdx, Math.max(0, gridIds.length - 1));
   const selectedGridId = gridIds[safeIdx] ?? null;
 
+  // 直接订阅全局 grid 变更信号作为唯一 refetch 触发源；
+  // parent 透传的 refreshKey 是同一事件流（gridsRevision → listGrids → setRefreshKey）
+  // 的下游产物，加入 deps 会导致每次事件多发一次冗余 GET /grids/{id}。
+  const gridsRevision = useAppStore((s) => s.gridsRevision);
+
   // safeIdx already clamps selectedIdx to valid range; no effect needed
 
   // Fetch grid data when expanded and selectedGridId is available
@@ -176,6 +189,8 @@ export function GridPreviewPanel({
     let cancelled = false;
     // Clear stale data and show spinner when switching batches
     if (!grid || grid.id !== selectedGridId) {
+      // 切换批次时清空旧数据并展示加载状态，再触发异步 fetch
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLoading(true);
       setGrid(null);
     }
@@ -190,7 +205,7 @@ export function GridPreviewPanel({
       })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : t("grid_load_failed"));
+          setError(errMsg(err, t("grid_load_failed")));
           setLoading(false);
         }
       });
@@ -198,15 +213,20 @@ export function GridPreviewPanel({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- grid 用于判断是否切换批次，加入 deps 会在每次拉取完成后触发重新拉取，导致无限循环；t 稳定可忽略
-  }, [expanded, selectedGridId, projectName, refreshKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- grid 仅用于切换批次判断；refreshKey 与 gridsRevision 同源，仅保留后者避免双触发；t 稳定
+  }, [expanded, selectedGridId, projectName, gridsRevision]);
 
   const isInProgress =
     grid?.status === "pending" || grid?.status === "generating" || grid?.status === "splitting";
 
+  // 优先使用持久化的 mtime 指纹做 cache-bust，跨页面刷新仍然有效；
+  // 回退到 refreshKey 仅用于指纹尚未送达前的当次会话。
+  const gridFp = useProjectsStore((s) =>
+    grid?.grid_image_path ? (s.assetFingerprints[grid.grid_image_path] ?? null) : null,
+  );
   const imageUrl =
     grid?.grid_image_path
-      ? API.getFileUrl(projectName, grid.grid_image_path, refreshKey)
+      ? API.getFileUrl(projectName, grid.grid_image_path, gridFp ?? refreshKey)
       : null;
 
   const refs = grid?.reference_images ?? [];
@@ -327,7 +347,7 @@ export function GridPreviewPanel({
                             onRegenerated?.();
                           })
                           .catch((err: unknown) => {
-                            setError(err instanceof Error ? err.message : t("grid_regenerate_failed"));
+                            setError(errMsg(err, t("grid_regenerate_failed")));
                           })
                           .finally(() => setRegenerating(false));
                       }}

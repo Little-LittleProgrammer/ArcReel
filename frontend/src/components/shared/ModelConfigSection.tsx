@@ -1,51 +1,48 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { ProviderModelSelect } from "@/components/ui/ProviderModelSelect";
-import { DEFAULT_DURATIONS, lookupSupportedDurations } from "@/utils/provider-models";
+import { lookupSupportedDurations, lookupResolutions } from "@/utils/provider-models";
+import { isContinuousIntegerRange } from "@/utils/duration_format";
+import { ResolutionPicker } from "./ResolutionPicker";
+import { ImageModelDualSelect } from "./ImageModelDualSelect";
+import { useEndpointCatalogStore } from "@/stores/endpoint-catalog-store";
+import { CARD_STYLE } from "@/components/ui/darkroom-tokens";
 import type { ProviderInfo } from "@/types/provider";
 import type { CustomProviderInfo } from "@/types/custom-provider";
 
-// ---------------------------------------------------------------------------
-// Module-level stable defaults
-// ---------------------------------------------------------------------------
-
 const EMPTY_CUSTOM_PROVIDERS: CustomProviderInfo[] = [];
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
 export interface ModelConfigValue {
-  videoBackend: string; // "" = use global default
-  imageBackend: string;
+  videoBackend: string;
+  imageBackendT2I: string;
+  imageBackendI2I: string;
   textBackendScript: string;
   textBackendOverview: string;
   textBackendStyle: string;
-  defaultDuration: number | null; // null = auto
+  defaultDuration: number | null;
+  videoResolution: string | null;
+  imageResolution: string | null;
 }
 
 export interface ModelConfigSectionProps {
   value: ModelConfigValue;
   onChange: (next: ModelConfigValue) => void;
-  /** Backend lists for each dropdown — strings like "gemini-aistudio/veo-3.1-generate-001" */
   options: {
     videoBackends: string[];
     imageBackends: string[];
     textBackends: string[];
     providerNames: Record<string, string>;
   };
-  /** For lookupSupportedDurations — providers may be empty if caller hasn't loaded them */
   providers: ProviderInfo[];
   customProviders?: CustomProviderInfo[];
-  /** Global default values shown as hint text under each "use global default" option */
   globalDefaults: {
     video: string;
-    image: string;
+    imageT2I: string;
+    imageI2I: string;
     textScript: string;
     textOverview: string;
     textStyle: string;
   };
-  /** Optional visibility toggles (all default true) */
   enable?: {
     video?: boolean;
     image?: boolean;
@@ -54,9 +51,25 @@ export interface ModelConfigSectionProps {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
+interface ChannelCardProps {
+  kicker: string;
+  title: string;
+  children: React.ReactNode;
+}
+
+function ChannelCard({ kicker, title, children }: ChannelCardProps) {
+  return (
+    <div className="rounded-[10px] border border-hairline p-4" style={CARD_STYLE}>
+      <div className="mb-3">
+        <div className="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-accent-2">
+          {kicker}
+        </div>
+        <div className="mt-1 text-[13.5px] font-medium text-text">{title}</div>
+      </div>
+      {children}
+    </div>
+  );
+}
 
 export function ModelConfigSection({
   value,
@@ -69,36 +82,39 @@ export function ModelConfigSection({
 }: ModelConfigSectionProps) {
   const { t } = useTranslation("templates");
 
+  const endpointToMediaType = useEndpointCatalogStore((s) => s.endpointToMediaType);
+  const fetchEndpointCatalog = useEndpointCatalogStore((s) => s.fetch);
+  useEffect(() => {
+    if (customProviders.length > 0) void fetchEndpointCatalog();
+  }, [customProviders.length, fetchEndpointCatalog]);
+
   const showVideo = enable?.video !== false;
   const showImage = enable?.image !== false;
   const showText = enable?.text !== false;
   const showDuration = enable?.duration !== false;
 
-  // "Follow global default" (empty videoBackend) means the effective backend at
-  // generation time will be globalDefaults.video — duration options should
-  // reflect that model's real supported_durations, not the generic fallback.
   const effectiveVideoBackend = value.videoBackend || globalDefaults.video || "";
 
-  // Compute supported durations based on current effective video backend (pre-sorted)
-  const supportedDurations = useMemo<readonly number[]>(() => {
-    const raw = !effectiveVideoBackend
-      ? DEFAULT_DURATIONS
-      : (lookupSupportedDurations(providers, effectiveVideoBackend, customProviders) ?? DEFAULT_DURATIONS);
+  const supportedDurations = useMemo<readonly number[] | null>(() => {
+    if (!effectiveVideoBackend) return null;
+    const raw = lookupSupportedDurations(providers, effectiveVideoBackend, customProviders);
+    if (!raw || raw.length === 0) return null;
     return [...raw].sort((a, b) => a - b);
   }, [providers, effectiveVideoBackend, customProviders]);
 
-  // Video backend change: may reset duration if not supported by new backend
   const handleVideoChange = (next: string) => {
     const effectiveNext = next || globalDefaults.video || "";
     const nextDurations = effectiveNext
-      ? (lookupSupportedDurations(providers, effectiveNext, customProviders) ?? DEFAULT_DURATIONS)
-      : DEFAULT_DURATIONS;
+      ? lookupSupportedDurations(providers, effectiveNext, customProviders) ?? null
+      : null;
     const shouldReset =
-      value.defaultDuration !== null && !nextDurations.includes(value.defaultDuration);
+      value.defaultDuration !== null &&
+      (!nextDurations || !nextDurations.includes(value.defaultDuration));
     onChange({
       ...value,
       videoBackend: next,
       defaultDuration: shouldReset ? null : value.defaultDuration,
+      videoResolution: null,
     });
   };
 
@@ -106,15 +122,36 @@ export function ModelConfigSection({
     onChange({ ...value, defaultDuration: d });
   };
 
+  const renderResolutionField = (
+    backend: string,
+    resolution: string | null,
+    onResolutionChange: (v: string | null) => void,
+  ) => {
+    const res = lookupResolutions(providers, backend, customProviders, endpointToMediaType);
+    if (res.options.length === 0) return null;
+    return (
+      <div className="mt-3 flex items-center gap-2">
+        <span className="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+          {t("resolution_label")}
+        </span>
+        <ResolutionPicker
+          mode={res.isCustom ? "combobox" : "select"}
+          options={res.options}
+          value={resolution}
+          onChange={onResolutionChange}
+          placeholder={t("resolution_default_placeholder")}
+          aria-label={t("resolution_label")}
+        />
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-4">
-      {/* Description */}
-      <p className="text-sm text-gray-400">{t("default_hint")}</p>
+      <p className="text-[12.5px] leading-[1.55] text-text-3">{t("default_hint")}</p>
 
-      {/* Video card */}
       {showVideo && (
-        <div className="rounded-xl border border-gray-800 bg-gray-950/40 p-4">
-          <div className="mb-3 text-sm font-medium text-gray-100">{t("model_video")}</div>
+        <ChannelCard kicker="Video Channel" title={t("model_video")}>
           <ProviderModelSelect
             value={value.videoBackend}
             options={options.videoBackends}
@@ -131,82 +168,76 @@ export function ModelConfigSection({
             aria-label={t("model_video")}
           />
 
-          {/* Duration picker (nested inside video card) */}
-          {showDuration && (
-            <>
-              <div className="mt-3 mb-2 text-xs text-gray-400">{t("duration_label")}</div>
-              <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={t("duration_label")}>
-                {/* Auto button */}
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={value.defaultDuration === null}
-                  aria-label={t("duration_auto")}
-                  tabIndex={value.defaultDuration === null ? 0 : -1}
-                  onClick={() => handleDurationClick(null)}
-                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-                    value.defaultDuration === null
-                      ? "border-indigo-500 bg-indigo-500/10 text-indigo-300"
-                      : "border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600"
-                  }`}
-                >
-                  {t("duration_auto")}
-                </button>
+          {renderResolutionField(effectiveVideoBackend, value.videoResolution, (v) =>
+            onChange({ ...value, videoResolution: v }),
+          )}
 
-                {/* Per-duration buttons */}
-                {supportedDurations.map((d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    role="radio"
-                    aria-checked={value.defaultDuration === d}
-                    aria-label={`${d}s`}
-                    tabIndex={value.defaultDuration === d ? 0 : -1}
-                    onClick={() => handleDurationClick(d)}
-                    className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-                      value.defaultDuration === d
-                        ? "border-indigo-500 bg-indigo-500/10 text-indigo-300"
-                        : "border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600"
-                    }`}
-                  >
-                    {d}s
-                  </button>
-                ))}
+          {showDuration && supportedDurations && supportedDurations.length > 0 && (
+            <>
+              <div className="mb-2 mt-3 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("duration_label")}
               </div>
+              {isContinuousIntegerRange(supportedDurations) && supportedDurations.length >= 5 ? (
+                <DurationSlider
+                  options={supportedDurations}
+                  value={value.defaultDuration}
+                  onChange={handleDurationClick}
+                  ariaLabel={t("duration_label")}
+                  autoLabel={t("duration_auto")}
+                />
+              ) : (
+                <DurationButtonGroup
+                  options={supportedDurations}
+                  value={value.defaultDuration}
+                  onChange={handleDurationClick}
+                  ariaLabel={t("duration_label")}
+                  autoLabel={t("duration_auto")}
+                />
+              )}
             </>
           )}
-        </div>
+        </ChannelCard>
       )}
 
-      {/* Image card */}
       {showImage && (
-        <div className="rounded-xl border border-gray-800 bg-gray-950/40 p-4">
-          <div className="mb-3 text-sm font-medium text-gray-100">{t("model_image")}</div>
-          <ProviderModelSelect
-            value={value.imageBackend}
+        <ChannelCard kicker="Image Channel" title={t("model_image")}>
+          <ImageModelDualSelect
+            valueT2I={value.imageBackendT2I}
+            valueI2I={value.imageBackendI2I}
             options={options.imageBackends}
             providerNames={options.providerNames}
-            onChange={(next) => onChange({ ...value, imageBackend: next })}
-            allowDefault
-            defaultLabel={t("use_global_default")}
-            defaultHint={
-              globalDefaults.image
-                ? t("current_global_default", { value: globalDefaults.image })
-                : undefined
-            }
-            fallbackValue={globalDefaults.image || undefined}
-            aria-label={t("model_image")}
+            customProviders={customProviders}
+            onChange={({ t2i, i2i }) => {
+              const prevEffectiveT2I = value.imageBackendT2I || globalDefaults.imageT2I || "";
+              const nextEffectiveT2I = t2i || globalDefaults.imageT2I || "";
+              const next: ModelConfigValue = {
+                ...value,
+                imageBackendT2I: t2i,
+                imageBackendI2I: i2i,
+              };
+              if (prevEffectiveT2I !== nextEffectiveT2I) next.imageResolution = null;
+              onChange(next);
+            }}
+            globalDefaultT2I={globalDefaults.imageT2I || undefined}
+            globalDefaultI2I={globalDefaults.imageI2I || undefined}
           />
-        </div>
+
+          {renderResolutionField(
+            value.imageBackendT2I || globalDefaults.imageT2I || "",
+            value.imageResolution,
+            (v) => onChange({ ...value, imageResolution: v }),
+          )}
+        </ChannelCard>
       )}
 
-      {/* Text card */}
       {showText && (
-        <div className="rounded-xl border border-gray-800 bg-gray-950/40 p-4">
-          <div className="space-y-3">
+        <ChannelCard kicker="Text Channel" title={t("model_text_script")}>
+          <div className="space-y-3.5">
             {/* Script */}
             <div>
-              <div className="mb-1 text-xs text-gray-400">{t("model_text_script")}</div>
+              <div className="mb-1.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("model_text_script")}
+              </div>
               <ProviderModelSelect
                 value={value.textBackendScript}
                 options={options.textBackends}
@@ -226,7 +257,9 @@ export function ModelConfigSection({
 
             {/* Overview */}
             <div>
-              <div className="mb-1 text-xs text-gray-400">{t("model_text_overview")}</div>
+              <div className="mb-1.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("model_text_overview")}
+              </div>
               <ProviderModelSelect
                 value={value.textBackendOverview}
                 options={options.textBackends}
@@ -246,7 +279,9 @@ export function ModelConfigSection({
 
             {/* Style */}
             <div>
-              <div className="mb-1 text-xs text-gray-400">{t("model_text_style")}</div>
+              <div className="mb-1.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-text-4">
+                {t("model_text_style")}
+              </div>
               <ProviderModelSelect
                 value={value.textBackendStyle}
                 options={options.textBackends}
@@ -264,8 +299,127 @@ export function ModelConfigSection({
               />
             </div>
           </div>
-        </div>
+        </ChannelCard>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Duration sub-components
+// ---------------------------------------------------------------------------
+
+const DURATION_PILL_BASE =
+  "rounded-[7px] border px-3 py-1.5 font-mono text-[10.5px] font-bold uppercase tracking-[0.14em] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
+
+const durationActiveCls =
+  "border-accent/45 bg-accent-dim text-accent-2";
+
+const durationInactiveCls =
+  "border-hairline-soft bg-bg-grad-a/55 text-text-3 hover:border-hairline hover:text-text";
+
+const durationActiveStyle: CSSProperties = {
+  boxShadow: "0 0 18px -8px var(--color-accent-glow)",
+};
+
+function DurationButtonGroup({
+  options,
+  value,
+  onChange,
+  ariaLabel,
+  autoLabel,
+}: {
+  options: readonly number[];
+  value: number | null;
+  onChange: (next: number | null) => void;
+  ariaLabel: string;
+  autoLabel: string;
+}) {
+  const { t } = useTranslation("dashboard");
+  const isAutoActive = value === null;
+  return (
+    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={ariaLabel}>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={isAutoActive}
+        aria-label={autoLabel}
+        tabIndex={isAutoActive ? 0 : -1}
+        onClick={() => onChange(null)}
+        className={`${DURATION_PILL_BASE} ${isAutoActive ? durationActiveCls : durationInactiveCls}`}
+        style={isAutoActive ? durationActiveStyle : undefined}
+      >
+        {autoLabel}
+      </button>
+      {options.map((d) => {
+        const active = value === d;
+        return (
+          <button
+            key={d}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            aria-label={t("duration_seconds_value_text", { value: d })}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onChange(d)}
+            className={`${DURATION_PILL_BASE} ${active ? durationActiveCls : durationInactiveCls}`}
+            style={active ? durationActiveStyle : undefined}
+          >
+            {t("duration_seconds_value_text", { value: d })}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function DurationSlider({
+  options,
+  value,
+  onChange,
+  ariaLabel,
+  autoLabel,
+}: {
+  options: readonly number[];
+  value: number | null;
+  onChange: (next: number | null) => void;
+  ariaLabel: string;
+  autoLabel: string;
+}) {
+  const { t } = useTranslation("dashboard");
+  const min = options[0];
+  const max = options[options.length - 1];
+  const sliderValue = value === null ? min : value;
+  const isAutoActive = value === null;
+  return (
+    <div className="flex flex-wrap items-center gap-3">
+      <button
+        type="button"
+        role="radio"
+        aria-checked={isAutoActive}
+        aria-label={autoLabel}
+        onClick={() => onChange(null)}
+        className={`${DURATION_PILL_BASE} ${isAutoActive ? durationActiveCls : durationInactiveCls}`}
+        style={isAutoActive ? durationActiveStyle : undefined}
+      >
+        {autoLabel}
+      </button>
+      <input
+        type="range"
+        aria-label={ariaLabel}
+        aria-valuetext={
+          value === null ? autoLabel : t("duration_seconds_value_text", { value })
+        }
+        min={min}
+        max={max}
+        step={1}
+        value={sliderValue}
+        onChange={(e) => onChange(parseInt(e.target.value, 10))}
+        className="min-w-[120px] flex-1 accent-[var(--color-accent)]"
+      />
+      <span className="min-w-[2.5rem] text-right font-mono text-[11px] tabular-nums text-text-2">
+        {value === null ? autoLabel : t("duration_seconds_value_text", { value })}
+      </span>
     </div>
   );
 }

@@ -2,6 +2,8 @@
 
 import { useEffect } from "react";
 import { Route, Switch, Redirect, useParams } from "wouter";
+import { useTranslation } from "react-i18next";
+import { Loader2 } from "lucide-react";
 import { StudioLayout } from "@/components/layout";
 import { StudioCanvasRouter } from "@/components/canvas/StudioCanvasRouter";
 import { ProjectsPage } from "@/components/pages/ProjectsPage";
@@ -15,6 +17,42 @@ import { API } from "@/api";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAssistantStore } from "@/stores/assistant-store";
 import { useAuthStore } from "@/stores/auth-store";
+import { useConfigStatusStore } from "@/stores/config-status-store";
+
+// ---------------------------------------------------------------------------
+// ConfigStatusLoader — 登录后集中拉取一次配置完整性状态
+// ---------------------------------------------------------------------------
+
+/**
+ * 配置完整性（红点 / 必需设置提醒）的单点加载器，始终挂载在路由根，跨页面导航存活。
+ * 单例 store 一次初始化即覆盖所有落地页（首页 / 设置 / 项目），不再依赖某个具体页面
+ * 是否在 mount 时拉取。首次失败（如后端尚未就绪）时带界次数退避重试，无需手动刷新页面。
+ */
+function ConfigStatusLoader() {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      await useConfigStatusStore.getState().fetch();
+      if (cancelled) return;
+      if (!useConfigStatusStore.getState().initialized && attempts < 5) {
+        attempts += 1;
+        timer = setTimeout(() => void tick(), 800 * attempts);
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [isAuthenticated]);
+
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // AuthGuard — redirects to /login when not authenticated
@@ -22,17 +60,29 @@ import { useAuthStore } from "@/stores/auth-store";
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuthStore();
+  const { t } = useTranslation("common");
 
   if (isLoading) {
     return (
-      <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-500">
-        加载中...
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex h-screen items-center justify-center gap-2 bg-bg text-[13px] text-text-4"
+      >
+        <Loader2 aria-hidden className="h-4 w-4 motion-safe:animate-spin" />
+        <span>{t("loading")}</span>
       </div>
     );
   }
 
   if (!isAuthenticated) {
-    return <Redirect to="/login" />;
+    // 用 `~` 前缀跳到顶层 /login：AuthGuard 可能渲染在 nest 嵌套路由内
+    // （/app/projects/:projectName），此时相对路径会被拼到嵌套 base 之后，
+    // 必须用绝对路径才能落到真正的 /login。
+    // 带上完整原始 URL（取 window.location，nest 内 useLocation 只是相对路径），
+    // 登录成功后据此回跳。
+    const from = window.location.pathname + window.location.search + window.location.hash;
+    return <Redirect to={`~/login?from=${encodeURIComponent(from)}`} />;
   }
 
   return <>{children}</>;
@@ -97,6 +147,7 @@ function StudioWorkspace() {
 export function AppRoutes() {
   return (
     <>
+      <ConfigStatusLoader />
       <Switch>
         {/* Login page */}
         <Route path="/login" component={LoginPage} />

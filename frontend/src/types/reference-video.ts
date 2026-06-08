@@ -8,6 +8,20 @@ import type { TransitionType } from "./script";
 
 export type AssetKind = "character" | "scene" | "prop";
 
+/** Project.json sheet field for each asset kind. Mirrors lib/asset_types.py SHEET_KEY. */
+export const SHEET_FIELD: Record<AssetKind, "character_sheet" | "scene_sheet" | "prop_sheet"> = {
+  character: "character_sheet",
+  scene: "scene_sheet",
+  prop: "prop_sheet",
+};
+
+/** Project.json bucket for each asset kind. Mirrors lib/asset_types.py BUCKET_KEY. */
+export const BUCKET_FIELD: Record<AssetKind, "characters" | "scenes" | "props"> = {
+  character: "characters",
+  scene: "scenes",
+  prop: "props",
+};
+
 export interface Shot {
   /** 1-15s per shot */
   duration: number;
@@ -65,9 +79,14 @@ export interface ReferenceVideoUnit {
 export interface ReferenceVideoScript {
   episode: number;
   title: string;
-  content_mode: "reference_video";
+  /**
+   * 内容类型——参考视频集继承项目级 narration/drama，决定画面比例等次级配置；
+   * "视频来源"维度由 generation_mode 表达。
+   */
+  content_mode?: "narration" | "drama";
+  /** 参考视频集固定 "reference_video"；由后端 ScriptGenerator 注入。 */
+  generation_mode?: "reference_video";
   duration_seconds: number;
-  summary: string;
   schema_version?: number;
   novel: { title: string; chapter: string };
   video_units: ReferenceVideoUnit[];

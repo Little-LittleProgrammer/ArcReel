@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-try:
-    from google import genai
-    from PIL import Image
-except ImportError:
-    genai = None  # type: ignore
-    Image = None  # type: ignore
+from google import genai
+from PIL import Image
 
 from ..config.url_utils import normalize_base_url
 from ..gemini_shared import VERTEX_SCOPES, with_retry_async
+from ..logging_utils import format_kwargs_for_log
 from ..providers import PROVIDER_GEMINI
 from .base import (
     TextCapability,
@@ -50,11 +46,11 @@ class GeminiTextBackend:
 
             from ..system_config import resolve_vertex_credentials_path
 
-            credentials_file = resolve_vertex_credentials_path(Path(__file__).parent.parent.parent)
+            credentials_file = resolve_vertex_credentials_path()
             if credentials_file is None:
                 raise ValueError("未找到 Vertex AI 凭证文件\n请将服务账号 JSON 文件放入 vertex_keys/ 目录")
 
-            with open(credentials_file) as f:
+            with open(credentials_file, encoding="utf-8") as f:
                 creds_data = json_module.load(f)
             project_id = creds_data.get("project_id")
 
@@ -77,7 +73,7 @@ class GeminiTextBackend:
                 raise ValueError("Gemini API Key 未提供（API Key is required for AI Studio mode）。")
             effective_base_url = normalize_base_url(base_url)
             http_options = {"base_url": effective_base_url} if effective_base_url else None
-            self._client = genai.Client(api_key=api_key, http_options=http_options)
+            self._client = genai.Client(api_key=api_key, http_options=http_options)  # type: ignore[arg-type]
             if base_url:
                 logger.info("GeminiTextBackend: 使用 AI Studio 后端（Base URL: %s）", base_url)
             else:
@@ -145,10 +141,15 @@ class GeminiTextBackend:
         )
         contents = self._build_contents(request)
 
+        logger.info(
+            "调用 %s 文本 SDK payload=%s",
+            self.name,
+            format_kwargs_for_log({"model": self._model, "contents": contents, "config": config or None}),
+        )
         response = await self._client.aio.models.generate_content(
             model=self._model,
             contents=contents,
-            config=config if config else None,
+            config=config if config else None,  # type: ignore[arg-type]
         )
 
         text = response.text.strip() if response.text else ""

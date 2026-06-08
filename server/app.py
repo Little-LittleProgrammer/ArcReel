@@ -3,11 +3,18 @@
 
 启动方式:
     cd ArcReel
-    uv run uvicorn server.app:app --reload --port 1241
+    uv run uvicorn server.app:app --reload --reload-dir server --reload-dir lib --port 1241
+
+注意：必须用 --reload-dir 限定监视目录，否则 watchfiles 会扫描
+node_modules / .venv / .git / .worktrees 等十几万个文件，单核 CPU 50%+。
 """
 
 import asyncio
 import logging
+import os
+import platform
+import shutil
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,14 +27,21 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from lib import PROJECT_ROOT
+from lib.agent_session_store import session_store_enabled
+from lib.agent_session_store.import_local import migrate_local_transcripts_to_store
+from lib.agent_session_store.store import DbSessionStore
+from lib.app_data_dir import app_data_dir
+from lib.config.env_keys import PROVIDER_SECRET_KEYS
 from lib.db import async_session_factory, close_db, init_db
 from lib.generation_worker import GenerationWorker
-from lib.logging_config import setup_logging
+from lib.httpx_shared import shutdown_http_client, startup_http_client
+from lib.logging_config import attach_file_handler, migrate_legacy_log_dir, setup_logging
 from lib.project_migrations import cleanup_stale_backups, run_project_migrations
 from lib.source_loader.migration import migrate_project_source_encoding
 from server.auth import ensure_auth_password
 from server.routers import (
     agent_chat,
+    agent_config,
     api_keys,
     assets,
     assistant,
@@ -43,6 +57,7 @@ from server.routers import (
     providers,
     reference_videos,
     scenes,
+    system,
     system_config,
     tasks,
     usage,
@@ -51,9 +66,198 @@ from server.routers import (
 from server.routers import auth as auth_router
 from server.services.project_events import ProjectEventService
 
-# 初始化日志
-setup_logging()
+
+def assert_no_provider_secrets_in_environ() -> None:
+    """父进程禁止持有任何 provider 密钥；违反即 fail-fast。
+
+    Bash 沙箱子进程通过 fork 继承父 env，父进程必须把 provider secrets
+    全部下线到 DB，由 SDK options.env 显式注入子进程。
+    """
+    leaked = sorted(k for k in PROVIDER_SECRET_KEYS if os.environ.get(k))
+    if leaked:
+        raise RuntimeError(
+            f"SECURITY: 父进程 os.environ 含 provider 密钥: {leaked}. "
+            "请到 WebUI 系统配置页填写，并从 env / .env 中移除对应条目。"
+        )
+
+
+_APPARMOR_USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+_UNPRIV_USERNS_SYSCTL = Path("/proc/sys/kernel/unprivileged_userns_clone")
+_MAX_USER_NS_SYSCTL = Path("/proc/sys/user/max_user_namespaces")
+
+
+def _read_sysctl(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _diagnose_bwrap_failure() -> str:
+    """根据 host sysctl 状态给出 bwrap 失败的精确修复路径。
+
+    procfs 是宿主机共享的，容器内同样能读到 host sysctl 值，所以这套
+    诊断在 docker 内外都能跑。优先级：Ubuntu 24.04 AppArmor 限制 >
+    传统 unprivileged_userns_clone > max_user_namespaces > 兜底容器配置。
+    """
+    parts: list[str] = []
+
+    apparmor_userns = _read_sysctl(_APPARMOR_USERNS_SYSCTL)
+    if apparmor_userns == "1":
+        parts.append(
+            "Detected Ubuntu 24.04+ AppArmor restriction (root cause):\n"
+            "  /proc/sys/kernel/apparmor_restrict_unprivileged_userns = 1\n"
+            "  Blocks ALL unprivileged user namespaces. `apparmor:unconfined`\n"
+            "  in docker compose does NOT bypass this — it is a global LSM\n"
+            "  switch, not a per-process profile.\n"
+            "  Fix on HOST (not inside the container):\n"
+            "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n"
+            '    echo "kernel.apparmor_restrict_unprivileged_userns=0" '
+            "| sudo tee /etc/sysctl.d/60-arcreel-bwrap.conf"
+        )
+
+    userns_clone = _read_sysctl(_UNPRIV_USERNS_SYSCTL)
+    if userns_clone == "0":
+        parts.append(
+            "Unprivileged user namespaces disabled on host:\n"
+            "  /proc/sys/kernel/unprivileged_userns_clone = 0\n"
+            "  Fix on HOST: sudo sysctl -w kernel.unprivileged_userns_clone=1"
+        )
+
+    max_userns = _read_sysctl(_MAX_USER_NS_SYSCTL)
+    if max_userns == "0":
+        parts.append(
+            "User namespace count limit set to 0 on host:\n"
+            "  /proc/sys/user/max_user_namespaces = 0\n"
+            "  Fix on HOST: sudo sysctl -w user.max_user_namespaces=15000"
+        )
+
+    if not parts:
+        parts.append(
+            "Container likely missing security relaxation. docker compose:\n"
+            "  security_opt:\n"
+            "    - seccomp:unconfined\n"
+            "    - apparmor:unconfined\n"
+            "  cap_add:\n"
+            "    - NET_ADMIN"
+        )
+
+    return "\n".join(parts)
+
+
+def check_sandbox_available() -> bool:
+    """启动期检测 sandbox 工具可用性。
+
+    返回 ``True`` 表示沙箱可用且必须启用；返回 ``False`` 表示 SDK 不支持
+    当前平台（目前仅 Windows — sandboxing.md §"Platform support"），server
+    仍可启动但 sandbox 关闭，Bash 工具回退到
+    ``SessionManager._WINDOWS_BASH_PREFIX_WHITELIST`` 代码白名单。
+    macOS / Linux 工具缺失仍硬失败（受支持平台禁止降级）。
+    """
+    system = platform.system()
+    if system == "Darwin":
+        if shutil.which("sandbox-exec") is None:
+            raise RuntimeError(
+                "SANDBOX_UNAVAILABLE on macOS\n"
+                "  sandbox-exec: not found in PATH (should be system-installed)\n"
+                "Required for ArcReel agent runtime."
+            )
+        return True
+    if system == "Linux":
+        # 官方 sandboxing.md 明确 Linux 需要 bubblewrap + socat 一起装
+        # （bwrap 做进程/文件隔离，socat 做网络代理转发）。
+        missing = [name for name in ("bwrap", "socat") if shutil.which(name) is None]
+        if missing:
+            raise RuntimeError(
+                "SANDBOX_UNAVAILABLE on linux\n"
+                f"  missing in PATH: {', '.join(missing)}\n"
+                "Required for ArcReel agent runtime. Install:\n"
+                "  Ubuntu/Debian: sudo apt install bubblewrap socat\n"
+                "  Fedora:        sudo dnf install bubblewrap socat\n"
+                "  Arch:          sudo pacman -S bubblewrap socat"
+            )
+        # bwrap 装了不代表跑得起来。两类常见失败：
+        # 1) 创建 user namespace 被拒：seccomp / apparmor / sysctl 屏蔽
+        #    → "No permissions to create new namespace"
+        # 2) 新 net namespace 内 loopback 配置被拒：容器缺 CAP_NET_ADMIN
+        #    → "loopback: Failed RTM_NEWADDR: Operation not permitted"
+        # 用与 SDK 实际调用接近的 unshare 参数试跑，启动期就拦下来，
+        # 避免 agent 第一次调 Bash 才神秘失败。
+        probe_cmd = [
+            "bwrap",
+            "--unshare-user",
+            "--unshare-net",
+            "--unshare-pid",
+            "--ro-bind",
+            "/",
+            "/",
+            "/bin/true",
+        ]
+        try:
+            probe = subprocess.run(probe_cmd, capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                "SANDBOX_BWRAP_BROKEN on Linux\n"
+                f"  bwrap probe failed to execute: {exc}\n"
+                "Required for ArcReel agent runtime."
+            ) from exc
+        if probe.returncode != 0:
+            stderr = probe.stderr.decode("utf-8", errors="replace").strip() or "(no stderr)"
+            raise RuntimeError(
+                "SANDBOX_BWRAP_BROKEN on Linux\n"
+                f"  bwrap installed but cannot run: {stderr}\n"
+                f"{_diagnose_bwrap_failure()}"
+            )
+        return True
+    logger.warning(
+        "SANDBOX_UNSUPPORTED on %s — server 启动 sandbox=disabled，Bash 工具回退到代码白名单"
+        "（python .claude/skills/.../scripts/*.py / ffmpeg / ffprobe）。"
+        "生产部署推荐 macOS / Linux / Docker；Windows 用户建议使用 WSL2。",
+        system,
+    )
+    return False
+
+
+_DOCKERENV_PATH = Path("/.dockerenv")
+_CGROUP_PATH = Path("/proc/1/cgroup")
+
+
+def detect_docker_environment() -> bool:
+    """启动期一次性检测当前是否在 Docker / Podman 容器内。
+
+    用于决定是否启用 ``SandboxSettings.enableWeakerNestedSandbox``。
+    """
+    if _DOCKERENV_PATH.exists():
+        return True
+    try:
+        content = _CGROUP_PATH.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "docker" in content or "podman" in content
+
+
+# 初始化日志：模块导入期只挂 stream handler。
+# file handler 推迟到 lifespan，前面要先跑 migrate_legacy_log_dir()
+# 把旧 app_data_dir()/logs 平移到 PROJECT_ROOT/logs，否则新目录在 import
+# 期被创建会堵掉 rename；同时也避免 pytest 收集阶段 import server.app 时
+# 对真实文件系统产生副作用。
+setup_logging(file=False)
 logger = logging.getLogger(__name__)
+
+
+def _log_profile_sync_outcome(stats: dict, *, log: logging.Logger = logger) -> None:
+    """根据 ``sync_all_agent_profiles`` 返回的 stats 决定打 info 还是 warning。
+
+    ``stats["aborted"]`` 是 bool；而 bool 是 int 的子类——简单的
+    ``isinstance(v, int) and v > 0`` 会把 ``aborted=True`` 当成"同步完成"的正向
+    信号，与实际状态相反。先单独处理 abort 信号，再用 ``type(v) is int``（严格
+    类型相等）仅统计真正的整数计数。
+    """
+    if stats.get("aborted"):
+        log.warning("agent_runtime profile 同步已中止: %s", stats)
+        return
+    if any(type(v) is int and v > 0 for v in stats.values()):
+        log.info("agent_runtime profile 同步完成: %s", stats)
 
 
 async def _migrate_source_encoding_on_startup(projects_root: Path) -> dict[str, dict]:
@@ -106,6 +310,23 @@ async def _migrate_source_encoding_on_startup(projects_root: Path) -> dict[str, 
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # Startup
+    # 安全红线检测：先父进程 env 净化，再 sandbox 工具可用性，再 docker 检测
+    assert_no_provider_secrets_in_environ()
+    sandbox_enabled = check_sandbox_available()
+    # detect_docker_environment 仅在 sandbox 可用平台有意义（Linux 路径探测）；
+    # Windows 回退时跳过，避免无意义的文件系统调用。
+    is_docker = detect_docker_environment() if sandbox_enabled else False
+    logger.info("Sandbox runtime: enabled=%s docker=%s", sandbox_enabled, is_docker)
+
+    app.state.in_docker = is_docker
+    app.state.sandbox_enabled = sandbox_enabled
+
+    # 日志文件持久化：先一次性平移旧 app_data_dir()/logs，再挂 file handler。
+    # 顺序很重要——file handler 会 mkdir 新目录，提前挂会让 migrate 的 rename
+    # 撞到 "新旧都存在" 分支放弃迁移。
+    await asyncio.to_thread(migrate_legacy_log_dir)
+    attach_file_handler()
+
     ensure_auth_password()
 
     # Run Alembic migrations (auto-creates tables on first start)
@@ -114,7 +335,7 @@ async def lifespan(app: FastAPI):
     # Run any pending project.json schema migrations (file-based).
     # Both calls are synchronous filesystem walks — offload to a worker thread
     # so they don't block the event loop during uvicorn startup.
-    projects_root = PROJECT_ROOT / "projects"
+    projects_root = app_data_dir()
     migration_summary = await asyncio.to_thread(run_project_migrations, projects_root)
     if migration_summary.migrated or migration_summary.failed:
         logger.info(
@@ -137,47 +358,56 @@ async def lifespan(app: FastAPI):
             len(source_migration_summary),
         )
 
+    # Migrate any pre-existing local SDK jsonl transcripts into the DbSessionStore.
+    # Runs once (marker-gated); failures are non-fatal and logged.
+    if session_store_enabled():
+        try:
+            store = DbSessionStore(async_session_factory)
+            await migrate_local_transcripts_to_store(
+                store,
+                projects_root=projects_root,
+                data_dir=projects_root,  # same place .arcreel.db lives, so docker volume catches it
+            )
+        except Exception:
+            logger.exception("session-store transcript migration failed (non-fatal)")
+
     # Migrate legacy .system_config.json → DB (no-op if file doesn't exist or already migrated)
     try:
         from lib.config.migration import migrate_json_to_db
 
-        json_path = PROJECT_ROOT / "projects" / ".system_config.json"
+        json_path = app_data_dir() / ".system_config.json"
         async with async_session_factory() as session:
             await migrate_json_to_db(session, json_path)
     except Exception as exc:
         logger.warning("JSON→DB config migration failed (non-fatal): %s", exc)
 
-    # Sync Anthropic DB settings to env vars (Claude Agent SDK reads from os.environ)
-    try:
-        from lib.config.service import ConfigService, sync_anthropic_env
-
-        async with async_session_factory() as session:
-            svc = ConfigService(session)
-            all_settings = await svc.get_all_settings()
-            sync_anthropic_env(all_settings)
-    except Exception as exc:
-        logger.warning("DB→env Anthropic config sync failed (non-fatal): %s", exc)
-
-    # 修复存量项目的 agent_runtime 软连接（同步文件遍历 → 放到 worker 线程）
+    # 把 agent_runtime_profile 同步到存量项目（manifest 物化，同步文件 I/O → worker 线程）
     from lib.project_manager import ProjectManager
 
-    _pm = ProjectManager(PROJECT_ROOT / "projects")
-    _symlink_stats = await asyncio.to_thread(_pm.repair_all_symlinks)
-    if any(v > 0 for v in _symlink_stats.values()):
-        logger.info("agent_runtime 软连接修复完成: %s", _symlink_stats)
+    _pm = ProjectManager(app_data_dir())
+    _profile_sync_stats = await asyncio.to_thread(_pm.sync_all_agent_profiles)
+    _log_profile_sync_outcome(_profile_sync_stats)
+
+    # 启动共享 httpx 客户端（用于版本检查等外部 API 调用）
+    await startup_http_client()
 
     # Initialize async services
-    await assistant.assistant_service.startup()
+    await assistant.assistant_service.startup(in_docker=is_docker, sandbox_enabled=sandbox_enabled)
     assistant.assistant_service.session_manager.start_patrol()
 
     logger.info("启动 GenerationWorker...")
     worker = create_generation_worker()
     app.state.generation_worker = worker
+    # 注入 in-process cancel 回调必须在 worker.start() 之前，
+    # 否则有窗口期 callback 为 None、cancel running 信号丢失（违反 ADR 0006 秒级响应）。
+    from lib.generation_queue import get_generation_queue
+
+    get_generation_queue().set_worker_cancel_callback(worker.request_cancel)
     await worker.start()
     logger.info("GenerationWorker 已启动")
 
     logger.info("启动 ProjectEventService...")
-    project_event_service = ProjectEventService(PROJECT_ROOT)
+    project_event_service = ProjectEventService(PROJECT_ROOT, projects_root=app_data_dir())
     app.state.project_event_service = project_event_service
     await project_event_service.start()
     logger.info("ProjectEventService 已启动")
@@ -193,8 +423,20 @@ async def lifespan(app: FastAPI):
     worker = getattr(app.state, "generation_worker", None)
     if worker:
         logger.info("正在停止 GenerationWorker...")
-        await worker.stop()
+        from lib.generation_queue import get_generation_queue
+
+        # 先 stop（内部 drain inflight + 退出主循环）：期间 cancel API 仍可发起，
+        # callback 仍可用，避免重新部署窗口期 cancel 信号被丢弃。
+        # 依赖 worker.stop() 内部已 await _wait_inflight_completion——若后续重构
+        # stop 拆掉 drain 步骤，需同时回访这里的顺序假设。
+        # try/finally 保证 callback 清理必达：worker.stop 抛错时 _worker_cancel_callback
+        # 仍能清空，避免污染后续生命周期/测试。
+        try:
+            await worker.stop()
+        finally:
+            get_generation_queue().set_worker_cancel_callback(None)
         logger.info("GenerationWorker 已停止")
+    await shutdown_http_client()
     await close_db()
 
 
@@ -206,14 +448,52 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS 配置
+# CORS 配置（env 驱动）：
+#   - CORS_ORIGINS 未设置 / 空 / 包含 "*" → 通配 origins，credentials 强制关闭
+#     （CORS spec 不允许通配 + credentials 组合；Starlette 在初始化时会 RuntimeError）
+#   - 否则按逗号分隔解析为白名单，credentials 打开供前端附带 cookie / Authorization 跨域
+_cors_raw = os.environ.get("CORS_ORIGINS", "*").strip()
+_allow_origins: list[str] = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+if not _allow_origins or "*" in _allow_origins:
+    _allow_origins = ["*"]
+    _allow_credentials = False
+else:
+    _allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _resolve_listen_addr() -> tuple[str, int]:
+    """解析 ``LISTEN_HOST`` / ``LISTEN_PORT``，供 ``__main__`` 块与测试共用。
+
+    **作用范围**：仅当通过 ``python server/app.py`` 直接执行（走下方 ``__main__``）
+    时生效。通过 ``uvicorn server.app:app`` 这种标准 ASGI CLI 启动时，listen 地址
+    由 uvicorn 进程自身的 ``--host`` / ``--port`` 参数决定，本函数不参与 —— 因为
+    ASGI app 模块在 import 时无法回头改 uvicorn 进程的绑定。Docker、systemd 等
+    部署需要把 host/port 作为 uvicorn CLI 参数显式传入。
+
+    truthy 默认（``or``）兜底，覆盖 ``.env`` 误写空值（如 ``LISTEN_PORT=``）的场景。
+    """
+    host = os.environ.get("LISTEN_HOST") or "0.0.0.0"
+    port = int(os.environ.get("LISTEN_PORT") or "1241")
+    return host, port
+
+
+# 前端每 3s 轮询下述接口获取任务状态；稳态下成功响应会把真正的错误/慢请求淹没，
+# 所以对 2xx + 快速响应降级到 DEBUG，异常/慢响应仍走 INFO 保证可观测。
+_QUIET_POLL_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/api/v1/tasks"),
+        ("GET", "/api/v1/tasks/stats"),
+    }
+)
+_QUIET_SLOW_THRESHOLD_MS = 500.0
 
 
 @app.middleware("http")
@@ -235,7 +515,13 @@ async def request_logging_middleware(request: Request, call_next):
         raise
     if not _skip_log:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(
+        is_quiet = (
+            (request.method, path) in _QUIET_POLL_ENDPOINTS
+            and response.status_code < 400
+            and elapsed_ms < _QUIET_SLOW_THRESHOLD_MS
+        )
+        log = logger.debug if is_quiet else logger.info
+        log(
             "%s %s %d %.0fms",
             request.method,
             path,
@@ -260,8 +546,10 @@ app.include_router(tasks.router, prefix="/api/v1", tags=["任务队列"])
 app.include_router(project_events.router, prefix="/api/v1", tags=["项目变更流"])
 app.include_router(providers.router, prefix="/api/v1", tags=["供应商管理"])
 app.include_router(system_config.router, prefix="/api/v1", tags=["系统配置"])
+app.include_router(system.router, prefix="/api/v1", tags=["系统"])
 app.include_router(api_keys.router, prefix="/api/v1", tags=["API Key 管理"])
 app.include_router(agent_chat.router, prefix="/api/v1", tags=["Agent 对话"])
+app.include_router(agent_config.router, prefix="/api/v1", tags=["Agent 配置"])
 app.include_router(custom_providers.router, prefix="/api/v1", tags=["自定义供应商"])
 app.include_router(cost_estimation.router, prefix="/api/v1", tags=["费用估算"])
 app.include_router(grids.router, prefix="/api/v1", tags=["宫格图"])
@@ -329,4 +617,5 @@ if frontend_dist_dir.exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=1241, reload=True)
+    _host, _port = _resolve_listen_addr()
+    uvicorn.run(app, host=_host, port=_port, reload=True)

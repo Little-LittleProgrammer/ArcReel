@@ -22,6 +22,7 @@ import type {
   ProjectChangeBatchPayload,
   ProjectEventSnapshotPayload,
   GetSystemConfigResponse,
+  GetSystemVersionResponse,
   SystemConfigPatch,
   ApiKeyInfo,
   CreateApiKeyResponse,
@@ -35,6 +36,10 @@ import type {
   CustomProviderCreateRequest,
   CustomProviderModelInput,
   DiscoveredModel,
+  EndpointDescriptor,
+  CustomProviderCredentials,
+  AnthropicDiscoverRequest,
+  AnthropicDiscoverResponse,
   CostEstimateResponse,
   ReferenceVideoUnit,
   ReferenceResource,
@@ -43,6 +48,14 @@ import type {
 import type { GenerationMode } from "@/utils/generation-mode";
 import type { GridGeneration } from "@/types/grid";
 import type { Asset, AssetType, AssetCreatePayload, AssetUpdatePayload } from "@/types/asset";
+import type {
+  AgentCredential,
+  CreateAgentCredentialRequest,
+  PresetProvidersResponse,
+  TestConnectionRequest,
+  TestConnectionResponse,
+  UpdateAgentCredentialRequest,
+} from "@/types/agent-credential";
 import { getToken, clearToken } from "@/utils/auth";
 import i18n from "./i18n";
 
@@ -156,6 +169,20 @@ export interface SuccessResponse {
   message?: string;
 }
 
+/** 说书模式片段 PATCH 入参（drama 模式片段走 {@link API.updateScene}）。 */
+export interface SegmentUpdatePayload {
+  script_file: string;
+  duration_seconds?: number;
+  segment_break?: boolean;
+  image_prompt?: unknown;
+  video_prompt?: unknown;
+  transition_to_next?: string;
+  note?: string;
+  characters_in_segment?: string[];
+  scenes?: string[];
+  props?: string[];
+}
+
 /** Payload for {@link API.createProject}. */
 export interface CreateProjectPayload {
   title: string;
@@ -167,9 +194,12 @@ export interface CreateProjectPayload {
   style_template_id?: string | null;
   video_backend?: string | null;
   image_backend?: string | null;
+  image_provider_t2i?: string | null;
+  image_provider_i2i?: string | null;
   text_backend_script?: string | null;
   text_backend_overview?: string | null;
   text_backend_style?: string | null;
+  model_settings?: Record<string, { resolution?: string | null }>;
 }
 
 /** Draft metadata returned by listDrafts. */
@@ -240,7 +270,12 @@ function handleUnauthorized(response: Response): void {
   if (response.status !== 401) return;
 
   clearToken();
-  globalThis.location.href = "/login";
+  // 携带当前所在的站内地址，登录成功后回跳；仅对 /app/ 下的页面附加 from，
+  // 避免把登录页自身等非应用路径写进回跳参数。
+  const current = `${globalThis.location.pathname}${globalThis.location.search}${globalThis.location.hash}`;
+  globalThis.location.href = current.startsWith("/app/")
+    ? `/login?from=${encodeURIComponent(current)}`
+    : "/login";
   throw new Error("认证已过期，请重新登录");
 }
 
@@ -307,6 +342,23 @@ class API {
     return this.request("/system/config");
   }
 
+  static async getSystemVersion(): Promise<GetSystemVersionResponse> {
+    return this.request("/system/version");
+  }
+
+  static async downloadDiagnostics(): Promise<{ blob: Blob; filename: string }> {
+    const response = await fetch(
+      `${API_BASE}/system/logs/download`,
+      withAuth({ method: "GET" }),
+    );
+    await throwIfNotOk(response, `HTTP ${response.status}`);
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const match = disposition.match(/filename="?([^";]+)"?/);
+    const filename = match?.[1] ?? "arcreel-diagnostics.zip";
+    const blob = await response.blob();
+    return { blob, filename };
+  }
+
   static async updateSystemConfig(
     patch: SystemConfigPatch,
   ): Promise<GetSystemConfigResponse> {
@@ -359,6 +411,21 @@ class API {
     return this.request(`/projects/${encodeURIComponent(name)}`, {
       method: "DELETE",
     });
+  }
+
+  /** 三级解析（项目 > 系统设置 > 系统默认）后的视频模型能力。 */
+  static async getVideoCapabilities(name: string): Promise<{
+    provider_id: string;
+    model: string;
+    supported_durations: number[];
+    max_duration: number;
+    max_reference_images: number;
+    source: "registry" | "custom";
+    default_duration?: number | null;
+    content_mode?: string | null;
+    generation_mode?: string | null;
+  }> {
+    return this.request(`/projects/${encodeURIComponent(name)}/video-capabilities`);
   }
 
   static async requestExportToken(
@@ -603,7 +670,7 @@ class API {
     updates: Record<string, unknown>
   ): Promise<SuccessResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/scenes/${encodeURIComponent(sceneId)}`,
+      `/projects/${encodeURIComponent(projectName)}/script-scenes/${encodeURIComponent(sceneId)}`,
       {
         method: "PATCH",
         body: JSON.stringify({ script_file: scriptFile, updates }),
@@ -613,6 +680,7 @@ class API {
 
   // ==================== 片段管理（说书模式） ====================
 
+  /** `updates` 字段形状参见 {@link SegmentUpdatePayload}；保留 Record 以兼容 spread 调用。 */
   static async updateSegment(
     projectName: string,
     segmentId: string,
@@ -1056,13 +1124,20 @@ class API {
 
   static async cancelPreview(
     taskId: string
-  ): Promise<{ task: { task_id: string; task_type: string; resource_id: string }; cascaded: { task_id: string; task_type: string; resource_id: string }[] }> {
+  ): Promise<{
+    task: { task_id: string; task_type: string; resource_id: string; status: string };
+    cascaded: { task_id: string; task_type: string; resource_id: string }[];
+  }> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/cancel-preview`);
   }
 
   static async cancelTask(
     taskId: string
-  ): Promise<{ cancelled: TaskItem[]; skipped_running: TaskItem[] }> {
+  ): Promise<{
+    cancelled: TaskItem[];
+    cancelling: string[];
+    skipped_terminal: TaskItem[];
+  }> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/cancel`, {
       method: "POST",
     });
@@ -1504,10 +1579,64 @@ class API {
     return response.json() as Promise<ProviderCredential>;
   }
 
+  // ==================== Agent 配置 / 凭证 API ====================
+
+  static async listAgentPresetProviders(): Promise<PresetProvidersResponse> {
+    return this.request("/agent/preset-providers");
+  }
+
+  static async listAgentCredentials(): Promise<{ credentials: AgentCredential[] }> {
+    return this.request("/agent/credentials");
+  }
+
+  static async createAgentCredential(
+    data: CreateAgentCredentialRequest,
+  ): Promise<AgentCredential> {
+    return this.request("/agent/credentials", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  static async updateAgentCredential(
+    id: number,
+    data: UpdateAgentCredentialRequest,
+  ): Promise<AgentCredential> {
+    return this.request(`/agent/credentials/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
+  }
+
+  static async deleteAgentCredential(id: number): Promise<void> {
+    return this.request(`/agent/credentials/${id}`, { method: "DELETE" });
+  }
+
+  static async activateAgentCredential(id: number): Promise<{ active_id: number }> {
+    return this.request(`/agent/credentials/${id}/activate`, { method: "POST" });
+  }
+
+  static async testAgentCredential(id: number): Promise<TestConnectionResponse> {
+    return this.request(`/agent/credentials/${id}/test`, { method: "POST" });
+  }
+
+  static async testAgentConnectionDraft(
+    data: TestConnectionRequest,
+  ): Promise<TestConnectionResponse> {
+    return this.request("/agent/test-connection", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
   // ==================== 自定义供应商 API ====================
 
   static async listCustomProviders(): Promise<{ providers: CustomProviderInfo[] }> {
     return this.request("/custom-providers");
+  }
+
+  static async listEndpointCatalog(): Promise<{ endpoints: EndpointDescriptor[] }> {
+    return this.request("/custom-providers/endpoints");
   }
 
   static async createCustomProvider(data: CustomProviderCreateRequest): Promise<CustomProviderInfo> {
@@ -1518,7 +1647,7 @@ class API {
     return this.request(`/custom-providers/${id}`);
   }
 
-  static async updateCustomProvider(id: number, data: Partial<Omit<CustomProviderCreateRequest, "api_format" | "models">>): Promise<void> {
+  static async updateCustomProvider(id: number, data: Partial<Omit<CustomProviderCreateRequest, "discovery_format" | "models">>): Promise<void> {
     return this.request(`/custom-providers/${id}`, { method: "PATCH", body: JSON.stringify(data) });
   }
 
@@ -1534,16 +1663,35 @@ class API {
     return this.request(`/custom-providers/${id}/models`, { method: "PUT", body: JSON.stringify({ models }) });
   }
 
-  static async discoverModels(data: { api_format: string; base_url: string; api_key: string }): Promise<{ models: DiscoveredModel[] }> {
+  static async discoverModels(data: { discovery_format: string; base_url: string; api_key: string }): Promise<{ models: DiscoveredModel[] }> {
     return this.request("/custom-providers/discover", { method: "POST", body: JSON.stringify(data) });
   }
 
-  static async testCustomConnection(data: { api_format: string; base_url: string; api_key: string }): Promise<{ success: boolean; message: string }> {
+  static async discoverModelsForProvider(id: number): Promise<{ models: DiscoveredModel[] }> {
+    return this.request(`/custom-providers/${id}/discover`, { method: "POST" });
+  }
+
+  static async testCustomConnection(data: { discovery_format: string; base_url: string; api_key: string }): Promise<{ success: boolean; message: string }> {
     return this.request("/custom-providers/test", { method: "POST", body: JSON.stringify(data) });
   }
 
   static async testCustomConnectionById(id: number): Promise<{ success: boolean; message: string }> {
     return this.request(`/custom-providers/${id}/test`, { method: "POST" });
+  }
+
+  static async getCustomProviderCredentials(id: number): Promise<CustomProviderCredentials> {
+    return this.request(`/custom-providers/${id}/credentials`);
+  }
+
+  static async discoverAnthropicModels(
+    data: AnthropicDiscoverRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<AnthropicDiscoverResponse> {
+    return this.request("/custom-providers/discover-anthropic", {
+      method: "POST",
+      body: JSON.stringify(data),
+      signal: options.signal,
+    });
   }
 
   // ==================== 用量统计（按 provider 分组）API ====================

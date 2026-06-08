@@ -10,14 +10,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from lib.config.resolver import ConfigResolver
+    from lib.config.resolver import ConfigResolver, ProviderModel
 
-from lib import PROJECT_ROOT
+from lib.app_data_dir import app_data_dir
 from lib.asset_types import ASSET_SPECS
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.custom_provider import is_custom_provider
 from lib.db.base import DEFAULT_USER_ID
 from lib.gemini_shared import get_shared_rate_limiter
+from lib.i18n import DEFAULT_LOCALE
+from lib.i18n import _ as i18n_translate
+from lib.image_backends.base import ImageCapabilityError
 from lib.media_generator import MediaGenerator
 from lib.project_change_hints import emit_project_change_batch, project_change_source
 from lib.project_manager import ProjectManager
@@ -28,7 +31,14 @@ from lib.prompt_utils import (
     is_structured_video_prompt,
     video_prompt_to_yaml,
 )
-from lib.providers import PROVIDER_ARK, PROVIDER_BAILIAN, PROVIDER_GEMINI, PROVIDER_GROK, PROVIDER_OPENAI
+from lib.providers import (
+    PROVIDER_ARK,
+    PROVIDER_DASHSCOPE,
+    PROVIDER_GEMINI,
+    PROVIDER_GROK,
+    PROVIDER_OPENAI,
+    PROVIDER_VIDU,
+)
 from lib.storyboard_sequence import (
     build_previous_storyboard_reference,
     find_storyboard_item,
@@ -37,21 +47,15 @@ from lib.storyboard_sequence import (
     resolve_previous_storyboard_path,
 )
 from lib.thumbnail import extract_video_thumbnail
+from lib.video_backends.base import VideoCapabilityError
+from server.services.resolution_resolver import resolve_resolution
 
-pm = ProjectManager(PROJECT_ROOT / "projects")
+pm = ProjectManager(app_data_dir())
 rate_limiter = get_shared_rate_limiter()
 logger = logging.getLogger(__name__)
 
 # 按 (channel, provider_name, model) 缓存 Backend 实例，避免每次任务重建 API 客户端
-_backend_cache: dict[tuple[str, ...], Any] = {}
-
-# 各供应商默认视频分辨率
-DEFAULT_VIDEO_RESOLUTION: dict[str, str] = {
-    PROVIDER_GEMINI: "1080p",
-    PROVIDER_ARK: "720p",
-    PROVIDER_GROK: "720p",
-    PROVIDER_OPENAI: "720p",
-}
+_backend_cache: dict[tuple[str, str, str | None], Any] = {}
 
 # 新 provider_id → 旧 backend registry name 的映射
 _PROVIDER_ID_TO_BACKEND: dict[str, str] = {
@@ -61,7 +65,8 @@ _PROVIDER_ID_TO_BACKEND: dict[str, str] = {
     PROVIDER_ARK: PROVIDER_ARK,
     PROVIDER_GROK: PROVIDER_GROK,
     PROVIDER_OPENAI: PROVIDER_OPENAI,
-    PROVIDER_BAILIAN: PROVIDER_BAILIAN,
+    PROVIDER_VIDU: PROVIDER_VIDU,
+    PROVIDER_DASHSCOPE: PROVIDER_DASHSCOPE,
 }
 
 
@@ -74,19 +79,34 @@ def invalidate_backend_cache() -> None:
     _backend_cache.clear()
 
 
-def _parse_project_backend(raw: str | None) -> tuple[str | None, str | None]:
-    """解析 project.json 中 ``video_backend`` / ``image_backend`` 的 ``"provider/model"`` 格式。"""
-    if not raw:
-        return None, None
-    if "/" in raw:
-        provider, model = raw.split("/", 1)
-        return provider, model
-    return raw, None
+async def _resolve_effective_image_backend(
+    project: dict,
+    payload: dict | None,
+    *,
+    needs_i2i: bool = False,
+) -> ProviderModel:
+    """图片 provider 解析的薄投影：委托 ``ConfigResolver.resolve_image_backend``。
+
+    capability 仅在执行层确定（见 ``docs/adr/0001``）：``needs_i2i`` → i2i 槽，否则 t2i 槽。
+    与 ``_resolve_video_backend`` 一致不吞解析异常——未配置供应商时让 ``ConfigResolver`` 抛出的
+    清晰 ``ValueError``（"未找到可用的 image 供应商..."）直接透传，而非掩盖成空 backend 的通用错误。
+    """
+    from lib.config.resolver import ConfigResolver
+    from lib.db import async_session_factory
+
+    resolver = ConfigResolver(async_session_factory)
+    capability = "i2i" if needs_i2i else "t2i"
+    return await resolver.resolve_image_backend(project, payload, capability=capability)
 
 
 async def _create_custom_backend(provider_name: str, model_id: str | None, media_type: str):
-    """自定义供应商的 backend 创建路径。"""
+    """自定义供应商的 backend 创建路径。
+
+    media_type 仅用于回退到默认模型时分组（仍接收以兼容调用方调用语义）。
+    实际派发以 model.endpoint 为准；若 endpoint 推算 media_type 与 caller 传入不符 → 视为模型不存在并 fallback。
+    """
     from lib.custom_provider import parse_provider_id
+    from lib.custom_provider.endpoints import endpoint_to_media_type
     from lib.custom_provider.factory import create_custom_backend
     from lib.db import async_session_factory
     from lib.db.repositories.custom_provider_repo import CustomProviderRepository
@@ -97,8 +117,9 @@ async def _create_custom_backend(provider_name: str, model_id: str | None, media
         provider = await repo.get_provider(db_id)
         if provider is None:
             raise ValueError(f"自定义供应商 {provider_name} 不存在")
+
+        model = None
         if model_id:
-            # 校验 model_id 仍存在且已启用，否则回退到默认模型
             from sqlalchemy import select
 
             from lib.db.models.custom_provider import CustomProviderModel
@@ -106,21 +127,30 @@ async def _create_custom_backend(provider_name: str, model_id: str | None, media
             stmt = select(CustomProviderModel).where(
                 CustomProviderModel.provider_id == db_id,
                 CustomProviderModel.model_id == model_id,
-                CustomProviderModel.media_type == media_type,
                 CustomProviderModel.is_enabled == True,  # noqa: E712
             )
             result = await session.execute(stmt)
-            if result.scalar_one_or_none() is None:
-                logger.warning("自定义模型 %s/%s 已不存在或已禁用，回退到默认模型", provider_name, model_id)
+            candidate = result.scalar_one_or_none()
+            if candidate and endpoint_to_media_type(candidate.endpoint) == media_type:
+                model = candidate
+            else:
+                logger.warning(
+                    "自定义模型 %s/%s 已不存在 / 已禁用 / 媒体类型不符（期望 %s），回退到默认模型",
+                    provider_name,
+                    model_id,
+                    media_type,
+                )
                 model_id = None
 
-        if not model_id:
+        if model is None:
             default_model = await repo.get_default_model(db_id, media_type)
-            if default_model:
-                model_id = default_model.model_id
-            else:
+            if default_model is None:
                 raise ValueError(f"自定义供应商 {provider_name} 没有默认 {media_type} 模型")
-        return create_custom_backend(provider=provider, model_id=model_id, media_type=media_type)
+            model = default_model
+            model_id = default_model.model_id
+
+        assert model_id is not None
+        return create_custom_backend(provider=provider, model_id=model_id, endpoint=model.endpoint)
 
 
 async def _get_or_create_video_backend(
@@ -181,11 +211,18 @@ async def _fill_simple_provider_kwargs(
     kwargs: dict,
     effective_model: str | None,
 ) -> None:
-    """Ark/Grok/OpenAI 等简单供应商的通用配置填充。"""
+    """Ark/Grok/OpenAI 等简单供应商的通用配置填充。
+
+    base_url 优先级：用户在 DB 配置中显式填写 > ProviderMeta.default_base_url > 不传。
+    """
+    from lib.config.registry import PROVIDER_REGISTRY
+
     db_config = await resolver.provider_config(backend_name)
     kwargs["api_key"] = db_config.get("api_key")
     kwargs["model"] = effective_model
-    if base_url := db_config.get("base_url"):
+    meta = PROVIDER_REGISTRY.get(backend_name)
+    base_url = db_config.get("base_url") or (meta.default_base_url if meta else None)
+    if base_url:
         kwargs["base_url"] = base_url
 
 
@@ -237,38 +274,32 @@ async def _resolve_video_backend(
     resolver: ConfigResolver,
     payload: dict | None,
 ) -> tuple[Any | None, str, str]:
-    """解析视频后端，返回 (video_backend, video_backend_type, video_model)。
+    """解析并构造视频后端，返回 (video_backend, video_backend_type, video_model)。
 
-    仅在 payload 存在时创建 VideoBackend，避免图片任务因视频配置缺失而报错。
-    注意：video_backend_type 仅在 video_backend 为 None（回退到 GeminiClient）时生效，
-    因此只需要在全局默认回退分支中设置。
+    provider/model 的**解析**是 ``resolver.resolve_video_backend`` 的薄投影；backend **构造**
+    （``_get_or_create_video_backend``）留在原地。仅在 payload 存在时创建 VideoBackend，避免
+    图片任务因视频配置缺失而报错。注意：video_backend_type 仅在 video_backend 为 None
+    （回退到 GeminiClient）时生效。
     """
-    default_video_provider_id, video_model = await resolver.default_video_backend()
+    project = await asyncio.to_thread(get_project_manager().load_project, project_name) if payload else None
+    resolved = await resolver.resolve_video_backend(project, payload)
+
     video_backend = None
     video_backend_type = "aistudio"
+    mapped = _PROVIDER_ID_TO_BACKEND.get(resolved.provider_id, resolved.provider_id)
+    if mapped == PROVIDER_GEMINI:
+        video_backend_type = "vertex" if resolved.provider_id == "gemini-vertex" else "aistudio"
 
     if payload:
-        # provider 统一从项目配置 → 全局默认解析，调用方无需传递
-        project = await asyncio.to_thread(get_project_manager().load_project, project_name)
-
-        # 从 project.json 的 video_backend（"provider/model" 格式）解析
-        provider_name, project_model = _parse_project_backend(project.get("video_backend"))
-
-        if not provider_name:
-            provider_name = default_video_provider_id
-            mapped = _PROVIDER_ID_TO_BACKEND.get(provider_name, provider_name)
-            if mapped == PROVIDER_GEMINI:
-                video_backend_type = "vertex" if default_video_provider_id == "gemini-vertex" else "aistudio"
-
-        provider_settings: dict = {"model": project_model} if project_model else {}
+        provider_settings: dict = {"model": resolved.model_id} if resolved.model_id else {}
         video_backend = await _get_or_create_video_backend(
-            provider_name,
+            resolved.provider_id,
             provider_settings,
             resolver,
-            default_video_model=video_model,
+            default_video_model=resolved.model_id or None,
         )
 
-    return video_backend, video_backend_type, video_model
+    return video_backend, video_backend_type, resolved.model_id
 
 
 async def get_media_generator(
@@ -277,36 +308,29 @@ async def get_media_generator(
     *,
     user_id: str = DEFAULT_USER_ID,
     require_image_backend: bool = True,
+    needs_i2i: bool = False,
 ) -> MediaGenerator:
-    """创建 MediaGenerator。仅按调用场景初始化所需的 backend。"""
+    """创建 MediaGenerator。仅按调用场景初始化所需的 backend。
+
+    needs_i2i: 若调用方知晓本次任务带参考图，传 True 以选 I2I 默认 backend；否则用 T2I。
+    """
     from lib.config.resolver import ConfigResolver
     from lib.db import async_session_factory
 
     project_path = await asyncio.to_thread(get_project_manager().get_project_path, project_name)
     resolver = ConfigResolver(async_session_factory)
 
-    # 初始化阶段共享单一 session
     async with resolver.session() as r:
         image_backend = None
         if require_image_backend:
-            image_provider_id, image_model = await r.default_image_backend()
-            # payload 中的 image_provider（由入队时 _snapshot_image_backend 注入）
-            if payload and payload.get("image_provider"):
-                image_provider_id = payload["image_provider"]
-                image_model = payload.get("image_model", "") or image_model
-            else:
-                # 直接从 project.json 的 image_backend（"provider/model" 格式）读取
-                project = await asyncio.to_thread(get_project_manager().load_project, project_name)
-                proj_provider, proj_model = _parse_project_backend(project.get("image_backend"))
-                if proj_provider:
-                    # 仅当 provider 相同时才复用全局默认 model，避免跨 provider model 不匹配
-                    image_model = proj_model or (image_model if proj_provider == image_provider_id else None)
-                    image_provider_id = proj_provider
+            project = await asyncio.to_thread(get_project_manager().load_project, project_name)
+            resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=needs_i2i)
+            # 解析失败 → provider_id 为空，让 _get_or_create_image_backend 抛出清晰错误
             image_backend = await _get_or_create_image_backend(
-                image_provider_id,
+                resolved_image.provider_id,
                 {},
                 r,
-                default_image_model=image_model,
+                default_image_model=resolved_image.model_id or None,
             )
 
         # 解析 video backend（保持现有逻辑）
@@ -316,12 +340,11 @@ async def get_media_generator(
             payload,
         )
 
-    # 传原始 resolver 给 MediaGenerator（后续调用在 session scope 外）
     return MediaGenerator(
         project_path,
         rate_limiter=rate_limiter,
-        image_backend=image_backend,
-        video_backend=video_backend,
+        image_backend=image_backend,  # type: ignore[arg-type]
+        video_backend=video_backend,  # type: ignore[arg-type]
         config_resolver=resolver,
         user_id=user_id,
     )
@@ -329,7 +352,8 @@ async def get_media_generator(
 
 def get_aspect_ratio(project: dict, resource_type: str) -> str:
     if resource_type == "characters":
-        return "3:4"
+        # 角色采用四视图横版（issue #353）
+        return "16:9"
     if resource_type in ("scenes", "props"):
         return "16:9"
     # 优先读顶层字段；缺失时按 content_mode 推导（向后兼容）
@@ -343,6 +367,8 @@ def get_aspect_ratio(project: dict, resource_type: str) -> str:
 
 def _normalize_storyboard_prompt(prompt: str | dict, style: str) -> str:
     if isinstance(prompt, str):
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty")
         return prompt
 
     if not isinstance(prompt, dict):
@@ -355,7 +381,8 @@ def _normalize_storyboard_prompt(prompt: str | dict, style: str) -> str:
     if not scene_text:
         raise ValueError("prompt.scene must not be empty")
 
-    composition = prompt.get("composition") if isinstance(prompt.get("composition"), dict) else {}
+    composition_raw = prompt.get("composition")
+    composition: dict = composition_raw if isinstance(composition_raw, dict) else {}
     normalized_prompt = {
         "scene": scene_text,
         "composition": {
@@ -368,8 +395,13 @@ def _normalize_storyboard_prompt(prompt: str | dict, style: str) -> str:
 
 
 def _normalize_video_prompt(prompt: str | dict) -> str:
+    """归一化视频 prompt 并在末尾追加统一文本化的反向提示词。"""
+    from lib.prompt_builders import append_video_negative_tail
+
     if isinstance(prompt, str):
-        return prompt
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty")
+        return append_video_negative_tail(prompt)
 
     if not isinstance(prompt, dict):
         raise ValueError("prompt must be a string or object")
@@ -402,7 +434,7 @@ def _normalize_video_prompt(prompt: str | dict) -> str:
         "ambiance_audio": str(prompt.get("ambiance_audio", "") or ""),
         "dialogue": normalized_dialogue,
     }
-    return video_prompt_to_yaml(normalized_prompt)
+    return append_video_negative_tail(video_prompt_to_yaml(normalized_prompt))
 
 
 def _get_model_default_duration(provider_name: str, model_name: str | None) -> int:
@@ -414,6 +446,37 @@ def _get_model_default_duration(provider_name: str, model_name: str | None) -> i
             return model_info.supported_durations[0]
     # 自定义供应商或 registry 中无此模型时 fallback
     return 4
+
+
+def assert_duration_supported(duration: int | float | str, supported_durations: list[int]) -> None:
+    """执行层能力守卫：duration 必须落在已解析 model 的 supported_durations 内。
+
+    这是 `duration ↔ supported_durations` 唯一的权威校验家——provider 在执行时才解析
+    （见 ADR-0001），故能力校验只能坐在 provider 解析之后。``supported_durations`` 为空时
+    放行（能力不可解析，不更坏：保持既有行为不被本次改动弄坏）。
+
+    duration 可能来自外部配置（payload / project.json），故安全解析字符串 / 浮点：
+    可解析为整数秒（如 ``"6"`` / ``6.0``）的归一化后比较；非整数秒（如 ``4.5``）一律
+    视为非法而**拒绝**，不做截断式归一化（截断会把本应拒绝的非法值静默修正）。
+
+    校验失败抛 :class:`VideoCapabilityError`（带稳定 code），与 ImageCapabilityError 对称——
+    Worker 捕获后渲染为本地化的 task.error_message。
+    """
+    if not supported_durations:
+        return
+    try:
+        numeric = float(duration)
+    except (TypeError, ValueError):
+        raise VideoCapabilityError("video_duration_invalid", duration=duration)
+    if not numeric.is_integer():
+        raise VideoCapabilityError("video_duration_invalid", duration=duration)
+    seconds = int(numeric)
+    if seconds not in supported_durations:
+        raise VideoCapabilityError(
+            "video_duration_not_supported",
+            duration=seconds,
+            supported=", ".join(str(d) for d in supported_durations),
+        )
 
 
 def _collect_sheet_paths(
@@ -599,7 +662,7 @@ _TASK_CHANGE_SPECS: dict[str, tuple] = {
 }
 
 
-def _emit_generation_success_batch(
+def emit_generation_success_batch(
     *,
     task_type: str,
     project_name: str,
@@ -639,7 +702,12 @@ def _emit_generation_success_batch(
 
 
 async def execute_storyboard_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     script_file = payload.get("script_file")
     if not script_file:
@@ -675,13 +743,18 @@ async def execute_storyboard_task(
         return _project, _project_path, _prompt_text, _ref_images
 
     project, project_path, prompt_text, reference_images = await asyncio.to_thread(_prepare)
+    _needs_i2i = bool(reference_images)
 
     generator = await get_media_generator(
         project_name,
         payload=payload,
         user_id=user_id,
+        needs_i2i=_needs_i2i,
     )
     aspect_ratio = get_aspect_ratio(project, "storyboards")
+
+    resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
+    image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
     _, version = await generator.generate_image_async(
         prompt=prompt_text,
@@ -689,7 +762,7 @@ async def execute_storyboard_task(
         resource_id=resource_id,
         reference_images=reference_images,
         aspect_ratio=aspect_ratio,
-        image_size="1K",
+        image_size=image_size,
     )
 
     def _finalize():
@@ -714,7 +787,12 @@ async def execute_storyboard_task(
 
 
 async def execute_video_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     script_file = payload.get("script_file")
     if not script_file:
@@ -737,7 +815,8 @@ async def execute_video_task(
     project, project_path, item = await asyncio.to_thread(_load)
     generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
 
-    # 优先从 generated_assets.storyboard_image 读取（宫格模式写 _first.png），回退到默认路径
+    # 优先读取 generated_assets.storyboard_image，回退默认路径。
+    # 旧宫格项目 storyboard_image 指向 scene_{id}_first.png，仍可正常解析。
     assets = item.get("generated_assets", {})
     storyboard_rel = assets.get("storyboard_image") if isinstance(assets, dict) else None
     storyboard_last_rel = assets.get("storyboard_last_image") if isinstance(assets, dict) else None
@@ -759,39 +838,51 @@ async def execute_video_task(
     seed = payload.get("seed")
     service_tier = payload.get("video_provider_settings", {}).get("service_tier", "default")
 
-    # 解析 provider / model，供 duration fallback 和分辨率查找共用
-    provider_settings = payload.get("video_provider_settings", {})
-    model_name = provider_settings.get("model")
-    # payload 中 video_provider 由任务入队时设置；project 中存的是 video_backend（"provider/model" 格式）
-    provider_name = payload.get("video_provider")
-    registry_provider_id = provider_name  # 用于 PROVIDER_REGISTRY 查找的原始 provider_id
-    if not provider_name:
-        video_backend = project.get("video_backend") or ""
-        if "/" in video_backend:
-            provider_name, model_name = video_backend.split("/", 1)
-            registry_provider_id = provider_name
-    if not provider_name:
-        from lib.config.resolver import ConfigResolver
-        from lib.db import async_session_factory
+    # 解析 provider / model（薄投影），供 duration fallback 和分辨率查找共用。
+    # 与执行层 backend 构造同走 resolve_video_backend，确保限流/分辨率与实际调用对齐。
+    from lib.config.resolver import ConfigResolver
+    from lib.db import async_session_factory
 
-        _resolver = ConfigResolver(async_session_factory)
-        try:
-            default_provider_id, default_model_id = await _resolver.default_video_backend()
-        except Exception:
-            default_provider_id, default_model_id = "gemini-aistudio", "veo-3.1-lite-generate-preview"
-        registry_provider_id = default_provider_id
-        model_name = model_name or default_model_id
-        provider_name = _PROVIDER_ID_TO_BACKEND.get(default_provider_id, default_provider_id)
-    # 将新 provider_id 映射为旧名称以查找分辨率
-    resolution_key = _PROVIDER_ID_TO_BACKEND.get(provider_name, provider_name)
-    video_model_settings = project.get("video_model_settings", {})
-    model_settings = video_model_settings.get(model_name, {}) if model_name else {}
-    resolution = model_settings.get("resolution") or DEFAULT_VIDEO_RESOLUTION.get(resolution_key, "1080p")
+    _resolver = ConfigResolver(async_session_factory)
+    try:
+        resolved_video = await _resolver.resolve_video_backend(project, payload)
+        registry_provider_id = resolved_video.provider_id
+        model_name = resolved_video.model_id or None
+    except Exception:
+        registry_provider_id, model_name = "gemini-aistudio", "veo-3.1-lite-generate-preview"
 
-    # duration fallback: payload > project.default_duration > supported_durations[0] > 4
-    duration_seconds = payload.get("duration_seconds") or project.get("default_duration")
+    # supported_durations 按上面已解析出的 provider/model 取（而非按 project 二次解析），
+    # 确保 duration 守卫所依据的能力与实际要调用的 model 一致——历史任务 payload 携带
+    # provider 覆盖时，二者不一致会用「项目默认 model 的能力」误判「payload 解析出的 model」。
+    # caps 失败不得丢弃已解析出的 provider/model，否则 resolve_resolution 与默认 duration
+    # 会错配。能力不可解析时留空，守卫遇空列表放行（不更坏，见 ADR-0002）。
+    supported_durations: list[int] = []
+    try:
+        caps = await _resolver.video_capabilities_for_model(registry_provider_id, model_name or "", project)
+        supported_durations = [int(d) for d in caps.get("supported_durations") or []]
+    except Exception:
+        supported_durations = []
+
+    resolution = await resolve_resolution(
+        project,
+        registry_provider_id,
+        model_name or "",
+    )
+
+    # duration 解析收口于执行层：payload > project.default_duration > caps 默认。
+    # 用 ``is not None`` 而非 ``or`` 取 payload 值，避免显式 falsy 值被当作未设置。
+    duration_seconds = payload.get("duration_seconds")
+    if duration_seconds is None:
+        duration_seconds = project.get("default_duration")
     if not duration_seconds:
-        duration_seconds = _get_model_default_duration(registry_provider_id, model_name)
+        duration_seconds = (
+            supported_durations[0]
+            if supported_durations
+            else _get_model_default_duration(registry_provider_id, model_name)
+        )
+    # 能力守卫：provider 解析之后的唯一权威家（见 ADR-0001）。安全解析交给守卫，
+    # 此处不预先 int() 截断，避免把非整数秒静默修正成「碰巧合法」的值。
+    assert_duration_supported(duration_seconds, supported_durations)
 
     _, version, _, video_uri = await generator.generate_video_async(
         prompt=prompt_text,
@@ -802,9 +893,33 @@ async def execute_video_task(
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
         resolution=resolution,
+        task_id=task_id,
         seed=seed,
         service_tier=service_tier,
     )
+
+    return await _finalize_video_task(
+        project_name=project_name,
+        script_file=script_file,
+        project_path=project_path,
+        resource_id=resource_id,
+        version=version,
+        video_uri=video_uri,
+        generator=generator,
+    )
+
+
+async def _finalize_video_task(
+    *,
+    project_name: str,
+    script_file: str,
+    project_path: Path,
+    resource_id: str,
+    version: int,
+    video_uri: str | None,
+    generator: Any,
+) -> dict[str, Any]:
+    """Normal + resume 共用的 finalize 逻辑：写 scene asset + 抽缩略图 + 返回 result dict。"""
 
     def _update_video_metadata():
         get_project_manager().update_scene_asset(
@@ -825,7 +940,6 @@ async def execute_video_task(
 
     await asyncio.to_thread(_update_video_metadata)
 
-    # 提取视频首帧作为缩略图
     video_file = project_path / f"videos/scene_{resource_id}.mp4"
     thumbnail_file = project_path / f"thumbnails/scene_{resource_id}.jpg"
     if await extract_video_thumbnail(video_file, thumbnail_file):
@@ -855,7 +969,12 @@ async def execute_video_task(
 
 
 async def execute_character_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     prompt = str(payload.get("prompt", "") or "").strip()
     if not prompt:
@@ -879,9 +998,13 @@ async def execute_character_task(
         return _project, _full_prompt, _ref_images
 
     project, full_prompt, reference_images = await asyncio.to_thread(_prepare_char)
+    _needs_i2i = bool(reference_images)
 
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
+    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, needs_i2i=_needs_i2i)
     aspect_ratio = get_aspect_ratio(project, "characters")
+
+    resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
+    image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
     _, version = await generator.generate_image_async(
         prompt=full_prompt,
@@ -889,7 +1012,7 @@ async def execute_character_task(
         resource_id=resource_id,
         reference_images=reference_images,
         aspect_ratio=aspect_ratio,
-        image_size="1K",
+        image_size=image_size,
     )
 
     sheet_path = f"characters/{resource_id}.png"
@@ -948,15 +1071,18 @@ async def execute_design_task(
 
     project, full_prompt = await asyncio.to_thread(_prepare)
 
-    generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
+    generator = await get_media_generator(project_name, payload=payload, user_id=user_id, needs_i2i=False)
     aspect_ratio = get_aspect_ratio(project, bucket_key)
+
+    resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=False)
+    image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
     _, version = await generator.generate_image_async(
         prompt=full_prompt,
         resource_type=bucket_key,
         resource_id=resource_id,
         aspect_ratio=aspect_ratio,
-        image_size="1K",
+        image_size=image_size,
     )
 
     sheet_path = f"{bucket_key}/{resource_id}.png"
@@ -977,13 +1103,23 @@ async def execute_design_task(
 
 
 async def execute_scene_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     return await execute_design_task("scene", project_name, resource_id, payload, user_id=user_id)
 
 
 async def execute_prop_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     return await execute_design_task("prop", project_name, resource_id, payload, user_id=user_id)
 
@@ -1087,7 +1223,12 @@ def _collect_grid_reference_images(
 
 
 async def execute_grid_task(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str = DEFAULT_USER_ID
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute a grid image generation task.
 
@@ -1133,14 +1274,25 @@ async def execute_grid_task(
         if not prompt_text:
             raise ValueError("prompt is required for grid task")
 
+        _needs_i2i = bool(reference_images)
         generator = await get_media_generator(
             project_name,
             payload=payload,
             user_id=user_id,
+            needs_i2i=_needs_i2i,
         )
 
         project = await asyncio.to_thread(get_project_manager().load_project, project_name)
         aspect_ratio = payload.get("grid_aspect_ratio") or get_aspect_ratio(project, "storyboards")
+
+        resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
+        # 回填 grid metadata：route 层创建/重建时无法预知 needs_i2i，由此处补齐
+        grid.provider = resolved_image.provider_id
+        grid.model = resolved_image.model_id
+        grid_manager.save(grid)
+        image_size = (
+            await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id) or "2K"
+        )  # 宫格图保底高分辨率
 
         image_path, version = await generator.generate_image_async(
             prompt=prompt_text,
@@ -1148,7 +1300,7 @@ async def execute_grid_task(
             resource_id=resource_id,
             reference_images=reference_images,
             aspect_ratio=aspect_ratio,
-            image_size="2K",
+            image_size=image_size,
         )
 
         # e) Set grid_image_path, status to splitting
@@ -1166,47 +1318,53 @@ async def execute_grid_task(
         storyboards_dir.mkdir(parents=True, exist_ok=True)
 
         def _assign_cells():
-            import shutil
+            from lib.script_editor import resolve_items
 
-            asset_updates: list[tuple[str, str, str]] = []
+            # batch_update_scene_assets 在任一 scene_id 未命中时整批 fail-loud 回滚——避免
+            # cell.save() 已写 PNG 落盘后又因 KeyError 整批回滚留下 orphan PNG,这里先 load
+            # 当前剧本拿 valid id 集合,frame_chain 中已不存在的分镜(grid plan 生成后 agent
+            # split/remove 改动了剧本)跳过 cell PNG 保存 + 收集到 missing 列表 + warning。
+            pm = get_project_manager()
+            script = pm.load_script(project_name, script_file)
+            items, id_field, _kind = resolve_items(script)
+            valid_ids = {str(item.get(id_field)) for item in items if isinstance(item, dict)}
 
+            asset_updates: list[tuple[str, str, Any]] = []
+            missing_ids: list[str] = []
+
+            # 宫格已统一走普通图生视频（不再使用 first_last 模式），cell 仅作为
+            # next_scene_id 的起始分镜图，文件名与普通分镜对齐为 scene_{id}.png。
             for cell, frame in zip(cells, grid.frame_chain):
                 if frame.frame_type == "placeholder":
                     continue
+                if frame.frame_type not in ("first", "transition"):
+                    continue
+                if not frame.next_scene_id:
+                    continue
 
-                if frame.frame_type == "first" and frame.next_scene_id:
-                    # Save as first frame (storyboard_image) for next_scene_id
-                    cell_path = storyboards_dir / f"scene_{frame.next_scene_id}_first.png"
-                    cell.save(cell_path, format="PNG")
-                    frame.image_path = f"storyboards/scene_{frame.next_scene_id}_first.png"
-                    asset_updates.append((frame.next_scene_id, "storyboard_image", frame.image_path))
-                    # Write grid provenance
-                    asset_updates.append((frame.next_scene_id, "grid_id", resource_id))
-                    asset_updates.append((frame.next_scene_id, "grid_cell_index", frame.index))
+                if str(frame.next_scene_id) not in valid_ids:
+                    missing_ids.append(str(frame.next_scene_id))
+                    continue
 
-                elif frame.frame_type == "transition":
-                    # Save as last frame of prev scene
-                    if frame.prev_scene_id:
-                        last_path = storyboards_dir / f"scene_{frame.prev_scene_id}_last.png"
-                        cell.save(last_path, format="PNG")
-                        last_rel = f"storyboards/scene_{frame.prev_scene_id}_last.png"
-                        asset_updates.append((frame.prev_scene_id, "storyboard_last_image", last_rel))
-                    # Copy as first frame of next scene (same image, avoid re-encoding)
-                    if frame.next_scene_id:
-                        first_path = storyboards_dir / f"scene_{frame.next_scene_id}_first.png"
-                        if frame.prev_scene_id:
-                            shutil.copy2(last_path, first_path)
-                        else:
-                            cell.save(first_path, format="PNG")
-                        frame.image_path = f"storyboards/scene_{frame.next_scene_id}_first.png"
-                        asset_updates.append((frame.next_scene_id, "storyboard_image", frame.image_path))
-                        # Write grid provenance
-                        asset_updates.append((frame.next_scene_id, "grid_id", resource_id))
-                        asset_updates.append((frame.next_scene_id, "grid_cell_index", frame.index))
+                cell_rel = f"storyboards/scene_{frame.next_scene_id}.png"
+                cell_path = storyboards_dir / f"scene_{frame.next_scene_id}.png"
+                cell.save(cell_path, format="PNG")
+                frame.image_path = cell_rel
+                asset_updates.append((frame.next_scene_id, "storyboard_image", cell_rel))
+                asset_updates.append((frame.next_scene_id, "grid_id", resource_id))
+                asset_updates.append((frame.next_scene_id, "grid_cell_index", frame.index))
+
+            if missing_ids:
+                logger.warning(
+                    "grid %s: frame_chain 中以下分镜在剧本 %s 已不存在,跳过 cell 保存: %s",
+                    resource_id,
+                    script_file,
+                    sorted(set(missing_ids)),
+                )
 
             # Batch-write all asset updates in one script read+write pass
             if asset_updates:
-                get_project_manager().batch_update_scene_assets(
+                pm.batch_update_scene_assets(
                     project_name=project_name,
                     script_filename=script_file,
                     updates=asset_updates,
@@ -1238,12 +1396,17 @@ async def execute_grid_task(
 
 
 async def _execute_reference_video_task_proxy(
-    project_name: str, resource_id: str, payload: dict[str, Any], *, user_id: str
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Lazy proxy to avoid circular import: reference_video_tasks imports from this module."""
     from server.services.reference_video_tasks import execute_reference_video_task
 
-    return await execute_reference_video_task(project_name, resource_id, payload, user_id=user_id)
+    return await execute_reference_video_task(project_name, resource_id, payload, user_id=user_id, task_id=task_id)
 
 
 _TASK_EXECUTORS = {
@@ -1263,17 +1426,26 @@ async def execute_generation_task(task: dict[str, Any]) -> dict[str, Any]:
     resource_id = str(task.get("resource_id"))
     payload = task.get("payload") or {}
     user_id = task.get("user_id", DEFAULT_USER_ID)
+    queue_task_id = task.get("task_id")
 
     if not project_name:
         raise ValueError("task.project_name is required")
+    if not task_type:
+        raise ValueError("task.task_type is required")
 
     executor = _TASK_EXECUTORS.get(task_type)
     if executor is None:
         raise ValueError(f"unsupported task_type: {task_type}")
 
     with project_change_source("worker"):
-        result = await executor(project_name, resource_id, payload, user_id=user_id)
-        _emit_generation_success_batch(
+        try:
+            result = await executor(project_name, resource_id, payload, user_id=user_id, task_id=queue_task_id)
+        except (ImageCapabilityError, VideoCapabilityError) as err:
+            # Worker 后台无 request 上下文，按 DEFAULT_LOCALE 渲染稳定的 i18n 文案
+            # 落到 task.error_message，前端轮询时即可看到本地化提示
+            message = i18n_translate(err.code, locale=DEFAULT_LOCALE, **err.params)
+            raise RuntimeError(message) from err
+        emit_generation_success_batch(
             task_type=task_type,
             project_name=project_name,
             resource_id=resource_id,

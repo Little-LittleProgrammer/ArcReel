@@ -368,7 +368,7 @@ class TestNewAPIVideoBackend:
         assert result.duration_seconds == 0
 
     async def test_create_retries_on_5xx(self, tmp_path: Path):
-        """5xx HTTPStatusError 应通过 _NEWAPI_RETRYABLE_ERRORS 类型匹配重试。"""
+        """5xx HTTPStatusError 应通过 should_retry_submit 的 status_code 闸门重试。"""
         failing_resp = MagicMock()
         failing_resp.status_code = 503
         failing_resp.raise_for_status = MagicMock(side_effect=_make_http_error(503, "upstream busy"))
@@ -411,3 +411,186 @@ class TestNewAPIVideoBackend:
 
         assert result.task_id == "t-retry"
         assert mock_client.post.call_count == 3
+
+    async def test_create_non_retryable_4xx_fails_fast(self, tmp_path: Path):
+        """创建任务遇确定性 4xx（400）应一次失败，不重试。"""
+        bad_resp = _make_response(400, {"error": "bad request"})
+        bad_resp.raise_for_status = MagicMock(side_effect=_make_http_error(400, "bad request"))
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=bad_resp)
+        mock_client.get = AsyncMock(side_effect=AssertionError("4xx 应在创建阶段失败，不该轮询"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.retry._compute_wait", lambda attempt, backoff: 0.0),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend.generate(
+                    VideoGenerationRequest(
+                        prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                    )
+                )
+
+        assert mock_client.post.call_count == 1, "确定性 4xx 不该被 retry"
+
+    async def test_poll_non_retryable_4xx_fails_fast(self, tmp_path: Path):
+        """轮询遇确定性 4xx（401，如 token 失效）应一次失败，不重试到 max_wait 超时。"""
+        create_resp = _make_response(200, {"task_id": "t-401", "status": "queued"})
+        unauthorized_resp = _make_response(401, {"error": "unauthorized"})
+        unauthorized_resp.raise_for_status = MagicMock(side_effect=_make_http_error(401, "unauthorized"))
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=create_resp)
+        mock_client.get = AsyncMock(return_value=unauthorized_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.video_backends.newapi._POLL_INTERVAL_SECONDS", 0.0),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend.generate(
+                    VideoGenerationRequest(
+                        prompt="p", output_path=tmp_path / "o.mp4", aspect_ratio="9:16", duration_seconds=5
+                    )
+                )
+
+        assert mock_client.get.call_count == 1, "轮询确定性 4xx 应一击失败，不重试到超时"
+
+    async def test_resume_video_polls_existing_job(self, tmp_path: Path):
+        """resume_video 仅 poll + 下载,不 POST create (ADR 0007)。"""
+        poll_resp = _make_response(
+            200,
+            {
+                "task_id": "task-resume",
+                "status": "completed",
+                "url": "https://cdn/resumed.mp4",
+                "metadata": {"duration": 5},
+            },
+        )
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=AssertionError("resume 不应 POST create"))
+        mock_client.get = AsyncMock(return_value=poll_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        fake_download = AsyncMock(side_effect=_fake_download_factory(b"resumed"))
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.video_backends.newapi._POLL_INTERVAL_SECONDS", 0.0),
+            patch("lib.video_backends.newapi.download_video", fake_download),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            result = await backend.resume_video(
+                "task-resume",
+                VideoGenerationRequest(
+                    prompt="p", output_path=tmp_path / "out.mp4", aspect_ratio="9:16", duration_seconds=5
+                ),
+            )
+
+        mock_client.post.assert_not_called()
+        # 应该 GET 到 .../video/generations/task-resume
+        assert mock_client.get.call_args.args[0].endswith("/task-resume")
+        assert result.task_id == "task-resume"
+        assert (tmp_path / "out.mp4").read_bytes() == b"resumed"
+
+    async def test_poll_recognizes_expired_status(self, tmp_path: Path):
+        """fix #647 #5：poll 返回 status='expired' → 抛 ResumeExpiredError。"""
+        from lib.video_backends.base import ResumeExpiredError
+
+        expired_resp = _make_response(200, {"task_id": "task-x", "status": "expired"})
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=expired_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.video_backends.newapi._POLL_INTERVAL_SECONDS", 0.0),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            with pytest.raises(ResumeExpiredError) as ei:
+                await backend.resume_video(
+                    "task-x",
+                    VideoGenerationRequest(
+                        prompt="p", output_path=tmp_path / "out.mp4", aspect_ratio="9:16", duration_seconds=5
+                    ),
+                )
+            assert ei.value.job_id == "task-x"
+            assert ei.value.provider == PROVIDER_NEWAPI
+
+    async def test_resume_404_raises_resume_expired_without_retry(self, tmp_path: Path):
+        """resume 路径下 GET 返 404 应立即转 ResumeExpiredError，不被 retryable 框架重试到超时。"""
+        from lib.video_backends.base import ResumeExpiredError
+
+        # 构造 404 response 让 raise_for_status 真抛 HTTPStatusError（_make_response 默认 mock 空，需手工设）
+        not_found_resp = _make_response(404, {"error": "task not found"})
+        not_found_resp.raise_for_status = MagicMock(side_effect=_make_http_error(404, "task not found"))
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=not_found_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.video_backends.newapi._POLL_INTERVAL_SECONDS", 0.0),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            with pytest.raises(ResumeExpiredError) as ei:
+                await backend.resume_video(
+                    "task-404",
+                    VideoGenerationRequest(
+                        prompt="p", output_path=tmp_path / "out.mp4", aspect_ratio="9:16", duration_seconds=5
+                    ),
+                )
+            assert ei.value.job_id == "task-404"
+            assert ei.value.provider == PROVIDER_NEWAPI
+            # 不应被 retry 框架重试多次（应仅 1 次 GET 调用立即抛错）
+            assert mock_client.get.call_count == 1, "404 应一击转 ResumeExpiredError，不该被 retry"
+
+    async def test_generate_expired_status_raises_runtime_error_not_resume_expired(self, tmp_path: Path):
+        """generate 路径下 status='expired' 抛 RuntimeError，不带 [resume_expired] 语义。"""
+        from lib.video_backends.base import ResumeExpiredError
+
+        create_resp = _make_response(200, {"task_id": "task-new"})
+        expired_resp = _make_response(200, {"task_id": "task-new", "status": "expired"})
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=create_resp)
+        mock_client.get = AsyncMock(return_value=expired_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("lib.video_backends.newapi._POLL_INTERVAL_SECONDS", 0.0),
+        ):
+            from lib.video_backends.newapi import NewAPIVideoBackend
+
+            backend = NewAPIVideoBackend(api_key="k", base_url="https://x/v1", model="m")
+            with pytest.raises(RuntimeError) as ei:
+                await backend.generate(
+                    VideoGenerationRequest(
+                        prompt="p",
+                        output_path=tmp_path / "out.mp4",
+                        aspect_ratio="9:16",
+                        duration_seconds=5,
+                    ),
+                )
+            assert "expired" in str(ei.value).lower()
+            assert not isinstance(ei.value, ResumeExpiredError), "generate 路径不应抛 ResumeExpiredError"

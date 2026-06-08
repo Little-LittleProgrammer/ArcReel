@@ -1,11 +1,11 @@
 ---
 name: create-episode-script
-description: "单集 JSON 剧本生成 subagent。使用场景：(1) drafts/episode_N/ 中间文件已存在，需要生成最终 JSON 剧本，(2) 用户要求生成某集的 JSON 剧本，(3) manga-workflow 编排进入 JSON 剧本生成阶段。接收项目名和集数，调用 generate_script.py 生成 JSON，验证输出，返回生成结果摘要。"
+description: "单集 JSON 剧本生成 subagent。使用场景：(1) drafts/episode_N/ 中间文件已存在，需要生成最终 JSON 剧本，(2) 用户要求生成某集的 JSON 剧本，(3) manga-workflow 编排进入 JSON 剧本生成阶段。接收项目名和集数，调用 mcp__arcreel__generate_episode_script 工具生成 JSON，验证输出，返回生成结果摘要。"
 skills:
   - generate-script
 ---
 
-你的任务是调用 generate-script skill 生成最终的 JSON 格式剧本。
+你的任务是调用 `mcp__arcreel__generate_episode_script` 工具生成最终的 JSON 格式剧本。
 
 ## 任务定义
 
@@ -17,7 +17,7 @@ skills:
 
 ## 核心原则
 
-1. **直接调用脚本**：按照 generate-script skill 的指引调用 generate_script.py
+1. **直接调用工具**：按照 generate-script skill 的指引调用 `mcp__arcreel__generate_episode_script`
 2. **验证输出**：确认 JSON 文件生成且格式正确
 3. **完成即返回**：独立完成全部工作后返回，不等待用户确认
 
@@ -25,28 +25,27 @@ skills:
 
 ### Step 1: 确认前置条件
 
-使用 Read 工具读取 `projects/{项目名}/project.json`，确认：
+使用 Read 工具读取 `project.json`（相对 session cwd），确认：
 - content_mode 字段（narration 或 drama）
 - characters、scenes、props 已有数据
 
 使用 Glob 工具确认中间文件存在：
-- narration 模式：`projects/{项目名}/drafts/episode_{N}/step1_segments.md`
-- drama 模式：`projects/{项目名}/drafts/episode_{N}/step1_normalized_script.md`
+- narration 模式：`drafts/episode_{N}/step1_segments.md`
+- drama 模式：`drafts/episode_{N}/step1_normalized_script.md`
 
 如果中间文件不存在，报告错误并说明需要先运行哪个预处理 subagent。
 
-### Step 2: 调用 generate_script.py 生成 JSON 剧本
+### Step 2: 调用工具生成 JSON 剧本
 
-在项目目录下运行：
-```bash
-python .claude/skills/generate-script/scripts/generate_script.py --episode {N}
+```text
+mcp__arcreel__generate_episode_script({"episode": {N}})
 ```
 
-等待执行完成。如果失败，查看错误信息并尝试修复或报告问题。
+等待返回。返回 `is_error: true` 时查看错误信息并尝试修复或报告问题。
 
 ### Step 3: 验证生成结果
 
-使用 Read 工具读取生成的 `projects/{项目名}/scripts/episode_{N}.json`，
+使用 Read 工具读取生成的 `scripts/episode_{N}.json`，
 确认：
 - 文件存在且为有效 JSON
 - 包含 episode、content_mode 字段
@@ -65,7 +64,7 @@ python .claude/skills/generate-script/scripts/generate_script.py --episode {N}
 | 内容模式 | narration/drama |
 | 总片段/场景数 | XX 个 |
 | 总时长 | X 分 X 秒 |
-| 生成模型 | gemini-3-flash-preview |
+| 生成模型 | {脚本输出中实际使用的模型名} |
 
 **文件已保存**: `scripts/episode_{N}.json`
 

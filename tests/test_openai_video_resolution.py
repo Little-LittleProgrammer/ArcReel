@@ -1,123 +1,120 @@
-"""OpenAI 视频后端 resolution 参数映射测试。"""
+"""测试 OpenAIVideoBackend 的 size 解析：按 model+分辨率档吸附 sora 合法枚举，比例优先。
 
-from __future__ import annotations
+sora-2（base）仅 720p；sora-2-pro 选 1080p 时用 1080x1920/1920x1080 精确高清档。
+"""
 
-from lib.video_backends.openai import _resolve_size
+from unittest.mock import MagicMock
 
+import pytest
 
-class TestResolveSizeFunction:
-    """直接测试 _resolve_size 辅助函数。"""
-
-    def test_sora2_720p_9_16(self):
-        assert _resolve_size("720p", "9:16") == "720x1280"
-
-    def test_sora2_720p_16_9(self):
-        assert _resolve_size("720p", "16:9") == "1280x720"
-
-    def test_sora2pro_1080p_9_16(self):
-        assert _resolve_size("1080p", "9:16") == "1080x1920"
-
-    def test_sora2pro_1080p_16_9(self):
-        assert _resolve_size("1080p", "16:9") == "1920x1080"
-
-    def test_1024p_9_16(self):
-        assert _resolve_size("1024p", "9:16") == "1024x1792"
-
-    def test_1024p_16_9(self):
-        assert _resolve_size("1024p", "16:9") == "1792x1024"
-
-    def test_default_fallback_unknown_resolution(self):
-        """未知 resolution 应回退到默认值 720x1280。"""
-        assert _resolve_size("2160p", "9:16") == "720x1280"
-
-    def test_default_fallback_unknown_aspect_ratio(self):
-        """未知 aspect_ratio 应回退到默认值 720x1280。"""
-        assert _resolve_size("720p", "4:3") == "720x1280"
-
-    def test_default_fallback_both_unknown(self):
-        """resolution 和 aspect_ratio 均未知时回退到默认值。"""
-        assert _resolve_size("unknown", "unknown") == "720x1280"
+from lib.video_backends.base import VideoGenerationRequest
+from lib.video_backends.openai import _SORA_LEGAL_SIZES, OpenAIVideoBackend
 
 
-class TestGenerateUsesResolution:
-    """验证 generate() 实际传递给 API 的 size 参数会根据 resolution 变化。"""
+def _make_backend(model: str = "sora-2"):
+    backend = OpenAIVideoBackend.__new__(OpenAIVideoBackend)
+    backend._client = MagicMock()
+    backend._model = model
+    backend._capabilities = set()
+    return backend
 
-    async def _run_generate(self, tmp_path, resolution, aspect_ratio, mock_client):
-        from lib.video_backends.base import VideoGenerationRequest
-        from lib.video_backends.openai import OpenAIVideoBackend
 
-        backend = OpenAIVideoBackend(api_key="test-key")
-        output_path = tmp_path / "output.mp4"
-        request = VideoGenerationRequest(
-            prompt="test",
-            output_path=output_path,
-            resolution=resolution,
-            aspect_ratio=aspect_ratio,
-            duration_seconds=4,
-        )
-        await backend.generate(request)
-        return mock_client.videos.create_and_poll.call_args[1]["size"]
+async def _capture_size(backend, **req_kwargs) -> str:
+    captured: dict[str, object] = {}
 
-    async def test_generate_passes_1080p_9_16(self, tmp_path):
-        from unittest.mock import AsyncMock, MagicMock, patch
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop")
 
-        mock_video = MagicMock()
-        mock_video.id = "vid_1"
-        mock_video.status = "completed"
-        mock_video.seconds = "4"
-        mock_video.error = None
+    backend._client.videos.create = fake_create
+    req = VideoGenerationRequest(prompt="x", duration_seconds=4, **req_kwargs)
+    with pytest.raises(RuntimeError):
+        await backend.generate(req)
+    size = captured.get("size")
+    assert isinstance(size, str)  # size 必传
+    return size
 
-        mock_content = MagicMock()
-        mock_content.content = b"data"
 
-        mock_client = AsyncMock()
-        mock_client.videos.create_and_poll = AsyncMock(return_value=mock_video)
-        mock_client.videos.download_content = AsyncMock(return_value=mock_content)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aspect,expected", [("9:16", "720x1280"), ("16:9", "1280x720")])
+async def test_standard_aspect_maps_to_exact_legal_size(tmp_path, aspect, expected):
+    backend = _make_backend()
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio=aspect, resolution=None)
+    assert size == expected
+    assert size in _SORA_LEGAL_SIZES
 
-        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
-            size = await self._run_generate(tmp_path, "1080p", "9:16", mock_client)
 
-        assert size == "1080x1920"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolution", [None, "720p", "1080p", "4K"])
+async def test_resolution_does_not_break_ratio(tmp_path, resolution):
+    """sora-2（base）只有 720p 档：任何 resolution 都不破坏比例，始终 720x1280（清晰度让位比例/模型能力）。"""
+    backend = _make_backend()  # sora-2 base
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution=resolution)
+    assert size == "720x1280"
 
-    async def test_generate_passes_1080p_16_9(self, tmp_path):
-        from unittest.mock import AsyncMock, MagicMock, patch
 
-        mock_video = MagicMock()
-        mock_video.id = "vid_2"
-        mock_video.status = "completed"
-        mock_video.seconds = "4"
-        mock_video.error = None
+@pytest.mark.asyncio
+async def test_custom_resolution_value_ignored_uses_legal_size(tmp_path):
+    """自定义 resolution 值（如 1080x1920，非 sora 合法档）不再被透传成非法 size，按比例吸附合法档。"""
+    backend = _make_backend()
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution="1080x1920")
+    assert size == "720x1280"
+    assert size in _SORA_LEGAL_SIZES
 
-        mock_content = MagicMock()
-        mock_content.content = b"data"
 
-        mock_client = AsyncMock()
-        mock_client.videos.create_and_poll = AsyncMock(return_value=mock_video)
-        mock_client.videos.download_content = AsyncMock(return_value=mock_content)
+@pytest.mark.asyncio
+async def test_size_always_set_and_legal(tmp_path):
+    """size 字段必传且必为合法枚举——杜绝「不传 size 让上游决定比例」。"""
+    backend = _make_backend()
+    for aspect in ("9:16", "16:9", "1:1", "4:3", "21:9"):
+        size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio=aspect, resolution=None)
+        assert size in _SORA_LEGAL_SIZES, aspect
 
-        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
-            size = await self._run_generate(tmp_path, "1080p", "16:9", mock_client)
 
-        assert size == "1920x1080"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aspect,expected", [("9:16", "1080x1920"), ("16:9", "1920x1080")])
+async def test_sora2pro_1080p_uses_exact_high_res(tmp_path, aspect, expected):
+    """sora-2-pro + 1080p：返回精确比例的 1080p 档（修复本 PR 把 1080 档丢成 720p 的回归）。"""
+    backend = _make_backend(model="sora-2-pro")
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio=aspect, resolution="1080p")
+    assert size == expected
 
-    async def test_generate_default_fallback(self, tmp_path):
-        """不支持的 resolution + aspect_ratio 组合应回退到 720x1280。"""
-        from unittest.mock import AsyncMock, MagicMock, patch
 
-        mock_video = MagicMock()
-        mock_video.id = "vid_3"
-        mock_video.status = "completed"
-        mock_video.seconds = "4"
-        mock_video.error = None
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolution", [None, "720p"])
+async def test_sora2pro_default_and_720p_stay_720(tmp_path, resolution):
+    """sora-2-pro 缺分辨率或显式 720p 时落 720p（不擅自升 1080p，避免超额计费）。"""
+    backend = _make_backend(model="sora-2-pro")
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution=resolution)
+    assert size == "720x1280"
 
-        mock_content = MagicMock()
-        mock_content.content = b"data"
 
-        mock_client = AsyncMock()
-        mock_client.videos.create_and_poll = AsyncMock(return_value=mock_video)
-        mock_client.videos.download_content = AsyncMock(return_value=mock_content)
+@pytest.mark.asyncio
+async def test_sora2pro_4k_capped_to_1080p(tmp_path):
+    """sora 最高 1080p：sora-2-pro 请求 4K 封顶到 1080p 精确档（仍精确比例）。"""
+    backend = _make_backend(model="sora-2-pro")
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution="4K")
+    assert size == "1080x1920"
 
-        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
-            size = await self._run_generate(tmp_path, "4K", "1:1", mock_client)
 
-        assert size == "720x1280"
+@pytest.mark.asyncio
+async def test_sora2pro_custom_short_picks_nearest_tier(tmp_path):
+    """sora-2-pro 自定义分辨率（短边 1000，更近 1080）选最近档 1080p，不被「向下取整」误降到 720p。"""
+    backend = _make_backend(model="sora-2-pro")
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution="1000x1778")
+    assert size == "1080x1920"
+
+
+@pytest.mark.asyncio
+async def test_sora2_base_ignores_1080p_request(tmp_path):
+    """sora-2（base）不支持 1080p：请求 1080p 仍降级为 720x1280（清晰度让位模型能力）。"""
+    backend = _make_backend(model="sora-2")
+    size = await _capture_size(backend, output_path=tmp_path / "o.mp4", aspect_ratio="9:16", resolution="1080p")
+    assert size == "720x1280"
+
+
+def test_offratio_1024_sizes_dropped():
+    """1024x1792 / 1792x1024（4:7）已从合法档移除——比例优先不再产出 4:7 视频。"""
+    assert "1024x1792" not in _SORA_LEGAL_SIZES
+    assert "1792x1024" not in _SORA_LEGAL_SIZES
+    assert set(_SORA_LEGAL_SIZES) == {"720x1280", "1280x720", "1080x1920", "1920x1080"}

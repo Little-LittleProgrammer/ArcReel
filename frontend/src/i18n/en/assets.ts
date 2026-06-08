@@ -21,9 +21,12 @@ export default {
   "close": "Close",
   "library_title": "Asset Library",
   "library_subtitle": "Characters, scenes and props reusable across projects",
+  "library_tabs_label": "Asset type",
   "back_to_projects": "Back to projects",
   "add_asset": "New asset",
   "search_placeholder": "Search assets...",
+  "search_hint": "Type a keyword to search assets",
+  "no_results": "No matching assets",
   "library_empty_character": "No characters yet",
   "library_empty_scene": "No scenes yet",
   "library_empty_prop": "No props yet",
@@ -45,4 +48,5 @@ export default {
   "upload_sheet_short": "Upload",
   "edit": "Edit",
   "delete": "Delete",
+  "meta_updated_at": "Updated {{date}}",
 };

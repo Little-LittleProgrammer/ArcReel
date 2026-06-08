@@ -96,7 +96,7 @@ class _FakeTranscriptAdapter:
     def __init__(self, history=None):
         self.history = history or []
 
-    def read_raw_messages(self, sdk_session_id=None):
+    async def read_raw_messages(self, sdk_session_id=None, project_cwd=None):
         return list(self.history)
 
 
@@ -261,15 +261,6 @@ class TestAssistantServiceMore:
         assert snapshot["status"] == "running"
         assert snapshot["pending_questions"][0]["question_id"] == "aq-1"
 
-        replayed, overflow = service._drain_replay(asyncio.Queue())
-        assert replayed == []
-        assert overflow is False
-        q = asyncio.Queue()
-        q.put_nowait({"type": "_queue_overflow"})
-        replayed2, overflow2 = service._drain_replay(q)
-        assert replayed2 == []
-        assert overflow2 is True
-
         projector = AssistantStreamProjector(initial_messages=[])
         events, should_break = await service._dispatch_live_message(
             {"type": "_queue_overflow"},
@@ -420,6 +411,3 @@ class TestAssistantServiceMore:
         fallback = service._load_skill_metadata(fallback_skill_dir / "SKILL.md", "fallback")
         assert fallback["name"] == "fallback"
         assert fallback["description"] == "first non heading line"
-
-        # no .env => no-op path
-        service._load_project_env(tmp_path / "missing")

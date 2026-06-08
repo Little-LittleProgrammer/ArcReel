@@ -9,35 +9,32 @@ description: 为剧本场景生成分镜图。当用户说"生成分镜"、"预�
 
 > 生成模式规格详见 `.claude/references/generation-modes.md`。
 
-## 命令行用法
+## 工具调用
 
-```bash
-# 提交所有缺失分镜图到生成队列（自动检测 content_mode）
-python .claude/skills/generate-storyboard/scripts/generate_storyboard.py script.json
+**重要：生成分镜图必须调用下列 MCP 工具入队。此 skill 不提供任何 Python/Shell 脚本，不得用 BASH 调 `python .../scripts/*.py`。**
 
-# 为单个场景重新生成
-python .claude/skills/generate-storyboard/scripts/generate_storyboard.py script.json --scene E1S05
+通过 MCP 工具入队：
 
-# 为多个场景重新生成
-python .claude/skills/generate-storyboard/scripts/generate_storyboard.py script.json --scene-ids E1S01 E1S02
-```
+| 操作 | 工具 |
+|------|------|
+| 提交所有缺失分镜图 | `mcp__arcreel__generate_storyboards({"script": "episode_1.json"})` |
+| 重新生成指定 ID | `mcp__arcreel__generate_storyboards({"script": "episode_1.json", "segment_ids": ["E1S05"]})` |
+| 重新生成多个 ID | `mcp__arcreel__generate_storyboards({"script": "episode_1.json", "segment_ids": ["E1S01", "E1S02"]})` |
 
-> `--scene-ids` 和 `--segment-ids` 是同义别名（后者为 narration 模式的习惯称呼），效果相同。以下统一使用 `--scene-ids`。
-
-> **选择规则**：`--scene` 重生成一个；`--scene-ids` 重生成多个；未提供则提交所有缺失项。
-
-> **注意**：脚本要求 generation worker 在线，worker 负责实际图像生成与速率控制。
+> **选择规则**：`segment_ids` 兼容 narration 的 segment_id 与 drama 的 scene_id；未传则提交所有缺失项。
+>
+> **依赖**：generation worker 必须在线（图像/视频两条独立通道），worker 负责实际生成与速率控制。
 
 ## 工作流程
 
 1. **加载项目和剧本** — 确认所有角色都有 `character_sheet` 图像
-2. **生成分镜图** — 脚本自动检测 content_mode，按相邻关系串联依赖任务
+2. **生成分镜图** — MCP 工具自动检测 content_mode，按相邻关系串联依赖任务
 3. **审核检查点** — 展示每张分镜图，用户可批准或要求重新生成
 4. **更新剧本** — 更新 `storyboard_image` 路径和场景状态
 
 ## 角色一致性机制
 
-脚本自动处理以下参考图传入，无需手动指定：
+MCP 工具自动处理以下参考图传入，无需手动指定：
 - **character_sheet**：场景中出场角色的设计图，保持外貌一致
 - **scene_sheet / prop_sheet**：场景中出现的场景 / 道具设计图
 - **上一张分镜图**：相邻片段默认引用，提升画面连续性
@@ -45,7 +42,7 @@ python .claude/skills/generate-storyboard/scripts/generate_storyboard.py script.
 
 ## Prompt 模板
 
-脚本从剧本 JSON 读取以下字段构建 prompt：
+从剧本 JSON 读取以下字段构建 prompt：
 
 ```
 场景 [scene_id/segment_id] 的分镜图：
@@ -75,4 +72,4 @@ python .claude/skills/generate-storyboard/scripts/generate_storyboard.py script.
 - 单场景失败不影响批次，记录失败场景后继续
 - 生成结束后汇总报告所有失败场景和原因
 - 支持增量生成（跳过已存在的场景图）
-- 使用 `--scene-ids` 重新生成失败场景
+- 使用 `mcp__arcreel__generate_storyboards({"script": "...", "segment_ids": [...]})` 重新生成失败场景

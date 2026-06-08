@@ -5,12 +5,15 @@ import { ChevronDown, ChevronRight, History } from "lucide-react";
 import { API, type VersionInfo } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
+import { errMsg } from "@/utils/async";
 
 interface VersionTimeMachineProps {
   projectName: string;
   resourceType: "storyboards" | "videos" | "characters" | "scenes" | "props";
   resourceId: string;
   onRestore?: (version: number) => void | Promise<void>;
+  /** Icon-only trigger button: hides label and chevron for narrow card headers. */
+  iconOnly?: boolean;
 }
 
 function getImagePreviewHeightClass(
@@ -38,6 +41,7 @@ export function VersionTimeMachine({
   resourceType,
   resourceId,
   onRestore,
+  iconOnly = false,
 }: VersionTimeMachineProps) {
   const { t } = useTranslation("dashboard");
   const resourcePath =
@@ -63,6 +67,8 @@ export function VersionTimeMachine({
   // on next open. Do NOT close the panel — if it's open and a new generation
   // completes, the user should stay in context and see the refreshed list.
   useEffect(() => {
+    // 底层资源切换时重置版本列表与加载状态，等下次打开面板时重新拉取
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setVersions([]);
     setCurrentVersion(0);
     setLoading(false);
@@ -106,7 +112,7 @@ export function VersionTimeMachine({
     } catch (err) {
       useAppStore
         .getState()
-        .pushToast(t("switch_version_failed", { message: (err as Error).message }), "error");
+        .pushToast(t("switch_version_failed", { message: errMsg(err) }), "error");
     } finally {
       setRestoringVersion(null);
     }
@@ -184,16 +190,34 @@ export function VersionTimeMachine({
 
   return (
     <div>
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((prev) => !prev)}
-        className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
-      >
-        <History className="h-3 w-3" />
-        <span>{t("version_mgmt")}</span>
-        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-      </button>
+      {iconOnly ? (
+        <button
+          ref={triggerRef}
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          title={t("version_mgmt")}
+          aria-label={t("version_mgmt")}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          className="focus-ring inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[oklch(1_0_0_/_0.05)]"
+          style={{ color: "var(--color-text-3)" }}
+        >
+          <History className="h-3.5 w-3.5" />
+        </button>
+      ) : (
+        <button
+          ref={triggerRef}
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
+        >
+          <History className="h-3 w-3" />
+          <span>{t("version_mgmt")}</span>
+          {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        </button>
+      )}
 
       {open &&
         panelPos &&

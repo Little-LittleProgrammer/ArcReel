@@ -52,9 +52,19 @@ export interface EpisodesSummary {
   completed: number;
 }
 
+export const PHASE_ORDER = [
+  "setup",
+  "worldbuilding",
+  "scripting",
+  "production",
+  "completed",
+] as const;
+
+export type Phase = (typeof PHASE_ORDER)[number];
+
 /** Injected by StatusCalculator.calculate_project_status at read time */
 export interface ProjectStatus {
-  current_phase: "setup" | "worldbuilding" | "scripting" | "production" | "completed";
+  current_phase: Phase;
   phase_progress: number;
   characters: ProgressCategory;
   scenes: ProgressCategory;
@@ -87,6 +97,10 @@ export interface EpisodeMeta {
   generation_mode?: "storyboard" | "grid" | "reference_video";
 }
 
+export interface ModelSettingEntry {
+  resolution?: string | null;
+}
+
 export interface ProjectData {
   title: string;
   content_mode: "narration" | "drama";
@@ -106,12 +120,17 @@ export interface ProjectData {
   status?: ProjectStatus;
   video_backend?: string | null;
   image_backend?: string | null;
+  image_provider_t2i?: string | null;
+  image_provider_i2i?: string | null;
   /** Canonical values: storyboard | grid | reference_video. "single" is legacy-only. */
   generation_mode?: "storyboard" | "grid" | "reference_video" | "single";
   video_generate_audio?: boolean | null;
   text_backend_script?: string | null;
   text_backend_overview?: string | null;
   text_backend_style?: string | null;
+  model_settings?: Record<string, ModelSettingEntry>;
+  /** Legacy field: keyed by model_id only (before composite key refactor). Read-only at UI layer. */
+  video_model_settings?: Record<string, { resolution?: string | null }>;
   metadata?: {
     created_at: string;
     updated_at: string;
